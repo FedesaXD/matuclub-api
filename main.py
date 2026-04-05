@@ -146,3 +146,28 @@ def topBrawler(brawler_name: str, club: str = None):
     finally:
         cursor.close()
         conn.close()
+
+
+@app.get("/club/{club_num}/members")
+def clubMembers(club_num: str):
+    if club_num not in CLUBS:
+        return {"error": "Club no encontrado"}
+
+    club_tag = CLUBS[club_num]
+    conn = get_conn()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("""
+            SELECT tag, name, highest_trophies, icon_url
+            FROM players
+            WHERE club_tag = %s
+            ORDER BY highest_trophies DESC
+        """, (club_tag,))
+        rows = cursor.fetchall()
+
+        return [{"rank": i+1, "tag": tag, "name": n, "trophies": t, "icon_url": ico}
+                for i, (tag, n, t, ico) in enumerate(rows)]
+    finally:
+        cursor.close()
+        conn.close()
