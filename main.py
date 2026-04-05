@@ -62,7 +62,7 @@ def ver_datos(player_tag: str):
             FROM player_brawlers
             WHERE player_tag = %s
             ORDER BY trophies DESC
-            LIMIT 10
+            LIMIT 12
         """, (player_tag,))
         brawlers = cursor.fetchall()
 
@@ -124,7 +124,7 @@ def topBrawler(brawler_name: str, club: str = None):
                 JOIN players p ON pb.player_tag = p.tag
                 WHERE pb.brawler_name = %s AND p.club_tag = %s
                 ORDER BY pb.trophies DESC
-                LIMIT 10
+                LIMIT 12
             """, (brawler_name, club_tag))
         else:
             cursor.execute("""
@@ -133,7 +133,7 @@ def topBrawler(brawler_name: str, club: str = None):
                 JOIN players p ON pb.player_tag = p.tag
                 WHERE pb.brawler_name = %s
                 ORDER BY pb.trophies DESC
-                LIMIT 10
+                LIMIT 12
             """, (brawler_name,))
 
         rows = cursor.fetchall()
