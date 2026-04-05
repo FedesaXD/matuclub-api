@@ -91,21 +91,101 @@ def ver_datos(player_tag: str):
 def topPrestige():
     conn = get_conn()
     cursor = conn.cursor()
-
     try:
         cursor.execute("""
             SELECT tag, name, total_prestige
-            FROM players
-            ORDER BY total_prestige DESC
-            LIMIT 20
+            FROM players ORDER BY total_prestige DESC LIMIT 50
         """)
         rows = cursor.fetchall()
-
-        return [{"rank": i+1, "tag": tag, "name": n, "prestige": p}
-                for i, (tag, n, p) in enumerate(rows)]
+        return [{"rank": i+1, "tag": t, "name": n, "value": v}
+                for i, (t, n, v) in enumerate(rows)]
     finally:
-        cursor.close()
-        conn.close()
+        cursor.close(); conn.close()
+
+
+@app.get("/top/trophies")
+def topTrophies():
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT tag, name, highest_trophies
+            FROM players ORDER BY highest_trophies DESC LIMIT 50
+        """)
+        rows = cursor.fetchall()
+        return [{"rank": i+1, "tag": t, "name": n, "value": v}
+                for i, (t, n, v) in enumerate(rows)]
+    finally:
+        cursor.close(); conn.close()
+
+
+@app.get("/top/wins3v3")
+def topWins3v3():
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT tag, name, wins3v3
+            FROM players ORDER BY wins3v3 DESC LIMIT 50
+        """)
+        rows = cursor.fetchall()
+        return [{"rank": i+1, "tag": t, "name": n, "value": v}
+                for i, (t, n, v) in enumerate(rows)]
+    finally:
+        cursor.close(); conn.close()
+
+
+@app.get("/top/winssolo")
+def topWinsSolo():
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT tag, name, winsSolo
+            FROM players ORDER BY winsSolo DESC LIMIT 50
+        """)
+        rows = cursor.fetchall()
+        return [{"rank": i+1, "tag": t, "name": n, "value": v}
+                for i, (t, n, v) in enumerate(rows)]
+    finally:
+        cursor.close(); conn.close()
+
+
+@app.get("/top/winstreak")
+def topWinstreak():
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT tag, name, highestWinstreak, maxWsBrawler
+            FROM players ORDER BY highestWinstreak DESC LIMIT 50
+        """)
+        rows = cursor.fetchall()
+        return [{"rank": i+1, "tag": t, "name": n, "value": v, "brawler": b}
+                for i, (t, n, v, b) in enumerate(rows)]
+    finally:
+        cursor.close(); conn.close()
+
+
+@app.get("/top/brawler-trophies")
+def topBrawlerTrophies():
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT p.tag, p.name, pb.brawler_name, pb.trophies
+            FROM player_brawlers pb
+            JOIN players p ON pb.player_tag = p.tag
+            WHERE (pb.player_tag, pb.trophies) IN (
+                SELECT player_tag, MAX(trophies) FROM player_brawlers GROUP BY player_tag
+            )
+            ORDER BY pb.trophies DESC LIMIT 50
+        """)
+        rows = cursor.fetchall()
+        return [{"rank": i+1, "tag": t, "name": n, "brawler": b, "value": v}
+                for i, (t, n, b, v) in enumerate(rows)]
+    finally:
+        cursor.close(); conn.close()
 
 
 @app.get("/top/brawler/{brawler_name}")
