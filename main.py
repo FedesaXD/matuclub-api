@@ -38,7 +38,7 @@ def ver_datos(player_tag: str):
     try:
         cursor.execute("""
             SELECT name, highest_trophies, wins3v3, winsSolo,
-                   total_prestige, highestWinstreak, maxWsBrawler, club_tag, club_name, icon_id
+                   total_prestige, highestWinstreak, maxWsBrawler, club_tag, club_name, icon_url
             FROM players WHERE tag = %s
         """, (player_tag,))
 
@@ -47,7 +47,7 @@ def ver_datos(player_tag: str):
             return {"error": "Jugador no encontrado"}
 
         (name, highest_trophies, wins3v3, winsSolo,
-         total_prestige, highest_ws, ws_brawler, club_tag, club_name, icon_id) = result
+         total_prestige, highest_ws, ws_brawler, club_tag, club_name, icon_url) = result
 
         cursor.execute("""
             SELECT timestamp, trophies, wins3v3, winsSolo, total_prestige
@@ -78,7 +78,7 @@ def ver_datos(player_tag: str):
             },
             "club_tag": club_tag,
             "club_name": club_name,
-            "icon_id": icon_id,
+            "icon_url": icon_url,
             "history": [list(h) for h in history],
             "top_brawlers": [list(b) for b in brawlers]
         }
