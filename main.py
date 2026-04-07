@@ -300,6 +300,18 @@ def ensure_events_tables(cursor):
             UNIQUE(event_id, player_tag)
         )
     """)
+    # Migration: drop old metric CHECK constraint that only allowed 'trophies'
+    cursor.execute("""
+        DO $$
+        DECLARE c TEXT;
+        BEGIN
+            SELECT conname INTO c FROM pg_constraint
+            WHERE conrelid = 'events'::regclass AND contype = 'c' AND conname LIKE '%metric%';
+            IF c IS NOT NULL THEN
+                EXECUTE 'ALTER TABLE events DROP CONSTRAINT ' || quote_ident(c);
+            END IF;
+        END $$
+    """)
     # Migration: add brawler_name column if an older version of the table exists
     cursor.execute("""
         ALTER TABLE events ADD COLUMN IF NOT EXISTS brawler_name TEXT
