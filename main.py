@@ -260,15 +260,28 @@ def clubMembers(club_num: str):
 
 # ── EVENTS: HELPERS ───────────────────────────────────────────────────────────
 
+VALID_METRICS = ("trophies", "wins3v3", "winsSolo", "prestige", "brawler_trophies")
+
+# Maps metric → (players column for snapshot, players column for live value)
+# For brawler_trophies we query player_brawlers instead, handled separately.
+METRIC_PLAYER_COL = {
+    "trophies":       "highest_trophies",
+    "wins3v3":        "wins3v3",
+    "winsSolo":       "winsSolo",
+    "prestige":       "total_prestige",
+}
+
+
 def ensure_events_tables(cursor):
-    """Create events tables if they don't exist. Safe to call on every request."""
+    """Create/migrate events tables. Safe to call on every request."""
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS events (
             id SERIAL PRIMARY KEY,
             title TEXT NOT NULL,
             description TEXT,
             reward TEXT NOT NULL,
-            metric TEXT NOT NULL CHECK (metric IN ('trophies')),
+            metric TEXT NOT NULL,
+            brawler_name TEXT,                      -- only for brawler_trophies
             started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             ends_at TIMESTAMPTZ NOT NULL,
             closed_at TIMESTAMPTZ,
@@ -282,10 +295,27 @@ def ensure_events_tables(cursor):
             player_tag TEXT NOT NULL,
             player_name TEXT NOT NULL,
             icon_url TEXT,
-            trophies_start INTEGER NOT NULL,
-            trophies_end INTEGER,
+            value_start INTEGER NOT NULL,   -- starting value of the tracked metric
+            value_end INTEGER,              -- frozen on close; NULL while active
             UNIQUE(event_id, player_tag)
         )
+    """)
+    # Migration: add brawler_name column if an older version of the table exists
+    cursor.execute("""
+        ALTER TABLE events ADD COLUMN IF NOT EXISTS brawler_name TEXT
+    """)
+    # Migration: rename legacy trophies_start/trophies_end columns if they exist
+    cursor.execute("""
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name='event_snapshots' AND column_name='trophies_start'
+            ) THEN
+                ALTER TABLE event_snapshots RENAME COLUMN trophies_start TO value_start;
+                ALTER TABLE event_snapshots RENAME COLUMN trophies_end   TO value_end;
+            END IF;
+        END $$
     """)
 
 
@@ -304,21 +334,83 @@ def auto_close_expired(cursor):
     """)
 
 
-def compute_results(cursor, event_id: int):
-    """Return ranked leaderboard for an event."""
-    cursor.execute("""
-        SELECT
-            es.player_tag,
-            es.player_name,
-            es.icon_url,
-            es.trophies_start,
-            COALESCE(es.trophies_end, p.highest_trophies) AS trophies_now,
-            COALESCE(es.trophies_end, p.highest_trophies) - es.trophies_start AS delta
-        FROM event_snapshots es
-        LEFT JOIN players p ON es.player_tag = p.tag
-        WHERE es.event_id = %s
-        ORDER BY delta DESC
-    """, (event_id,))
+def snapshot_values(cursor, event_id: int, metric: str, brawler_name: Optional[str]):
+    """Insert starting-value snapshot for all players for the given metric."""
+    if metric == "brawler_trophies":
+        bn = (brawler_name or "").strip().upper()
+        cursor.execute("""
+            INSERT INTO event_snapshots (event_id, player_tag, player_name, icon_url, value_start)
+            SELECT %s, p.tag, p.name, p.icon_url, COALESCE(pb.trophies, 0)
+            FROM players p
+            LEFT JOIN player_brawlers pb
+              ON pb.player_tag = p.tag AND UPPER(pb.brawler_name) = %s
+        """, (event_id, bn))
+    else:
+        col = METRIC_PLAYER_COL[metric]
+        cursor.execute(f"""
+            INSERT INTO event_snapshots (event_id, player_tag, player_name, icon_url, value_start)
+            SELECT %s, tag, name, icon_url, {col}
+            FROM players
+        """, (event_id,))
+
+
+def freeze_values(cursor, event_id: int, metric: str, brawler_name: Optional[str]):
+    """Freeze final values into value_end for all participants of an event."""
+    if metric == "brawler_trophies":
+        bn = (brawler_name or "").strip().upper()
+        cursor.execute("""
+            UPDATE event_snapshots es
+            SET value_end = COALESCE(pb.trophies, 0)
+            FROM players p
+            LEFT JOIN player_brawlers pb
+              ON pb.player_tag = p.tag AND UPPER(pb.brawler_name) = %s
+            WHERE es.player_tag = p.tag AND es.event_id = %s
+        """, (bn, event_id))
+    else:
+        col = METRIC_PLAYER_COL[metric]
+        cursor.execute(f"""
+            UPDATE event_snapshots es
+            SET value_end = p.{col}
+            FROM players p
+            WHERE es.player_tag = p.tag AND es.event_id = %s
+        """, (event_id,))
+
+
+def compute_results(cursor, event_id: int, metric: str, brawler_name: Optional[str]):
+    """Return ranked leaderboard for an event, using live values when still active."""
+    if metric == "brawler_trophies":
+        bn = (brawler_name or "").strip().upper()
+        cursor.execute("""
+            SELECT
+                es.player_tag,
+                es.player_name,
+                es.icon_url,
+                es.value_start,
+                COALESCE(es.value_end, COALESCE(pb.trophies, 0)) AS value_now,
+                COALESCE(es.value_end, COALESCE(pb.trophies, 0)) - es.value_start AS delta
+            FROM event_snapshots es
+            LEFT JOIN players p ON es.player_tag = p.tag
+            LEFT JOIN player_brawlers pb
+              ON pb.player_tag = es.player_tag AND UPPER(pb.brawler_name) = %s
+            WHERE es.event_id = %s
+            ORDER BY delta DESC
+        """, (bn, event_id))
+    else:
+        col = METRIC_PLAYER_COL.get(metric, "highest_trophies")
+        cursor.execute(f"""
+            SELECT
+                es.player_tag,
+                es.player_name,
+                es.icon_url,
+                es.value_start,
+                COALESCE(es.value_end, p.{col}) AS value_now,
+                COALESCE(es.value_end, p.{col}) - es.value_start AS delta
+            FROM event_snapshots es
+            LEFT JOIN players p ON es.player_tag = p.tag
+            WHERE es.event_id = %s
+            ORDER BY delta DESC
+        """, (event_id,))
+
     rows = cursor.fetchall()
     return [
         {
@@ -326,11 +418,11 @@ def compute_results(cursor, event_id: int):
             "tag": tag,
             "name": name,
             "icon_url": ico,
-            "trophies_start": ts,
-            "trophies_now": tn,
+            "value_start": vs,
+            "value_now": vn,
             "delta": delta
         }
-        for i, (tag, name, ico, ts, tn, delta) in enumerate(rows)
+        for i, (tag, name, ico, vs, vn, delta) in enumerate(rows)
     ]
 
 
@@ -346,7 +438,7 @@ def getEvents():
         conn.commit()
 
         cursor.execute("""
-            SELECT id, title, description, reward, metric,
+            SELECT id, title, description, reward, metric, brawler_name,
                    started_at, ends_at, closed_at, is_active
             FROM events
             ORDER BY started_at DESC
@@ -354,14 +446,16 @@ def getEvents():
         rows = cursor.fetchall()
 
         result = []
-        for (eid, title, desc, reward, metric, started_at, ends_at, closed_at, is_active) in rows:
-            participants = compute_results(cursor, eid)
+        for (eid, title, desc, reward, metric, brawler_name,
+             started_at, ends_at, closed_at, is_active) in rows:
+            participants = compute_results(cursor, eid, metric, brawler_name)
             result.append({
                 "id": eid,
                 "title": title,
                 "description": desc,
                 "reward": reward,
                 "metric": metric,
+                "brawler_name": brawler_name,
                 "started_at": started_at.isoformat() if started_at else None,
                 "ends_at": ends_at.isoformat() if ends_at else None,
                 "closed_at": closed_at.isoformat() if closed_at else None,
@@ -381,6 +475,7 @@ class CreateEventBody(BaseModel):
     description: Optional[str] = None
     reward: str
     metric: str = "trophies"
+    brawler_name: Optional[str] = None   # required when metric == brawler_trophies
     duration_hours: float
 
 
@@ -388,8 +483,13 @@ class CreateEventBody(BaseModel):
 def createEvent(body: CreateEventBody, x_admin_key: Optional[str] = Header(None)):
     check_admin(x_admin_key)
 
-    if body.metric not in ("trophies",):
-        raise HTTPException(status_code=400, detail="metric invalida. Valores válidos: trophies")
+    if body.metric not in VALID_METRICS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"metric invalida. Valores válidos: {', '.join(VALID_METRICS)}"
+        )
+    if body.metric == "brawler_trophies" and not body.brawler_name:
+        raise HTTPException(status_code=400, detail="brawler_name es requerido para la metric brawler_trophies")
     if body.duration_hours <= 0:
         raise HTTPException(status_code=400, detail="duration_hours debe ser mayor a 0")
 
@@ -405,18 +505,14 @@ def createEvent(body: CreateEventBody, x_admin_key: Optional[str] = Header(None)
         """)
 
         cursor.execute("""
-            INSERT INTO events (title, description, reward, metric, ends_at)
-            VALUES (%s, %s, %s, %s, NOW() + INTERVAL '1 hour' * %s)
+            INSERT INTO events (title, description, reward, metric, brawler_name, ends_at)
+            VALUES (%s, %s, %s, %s, %s, NOW() + INTERVAL '1 hour' * %s)
             RETURNING id
-        """, (body.title, body.description, body.reward, body.metric, body.duration_hours))
+        """, (body.title, body.description, body.reward, body.metric,
+              body.brawler_name, body.duration_hours))
         event_id = cursor.fetchone()[0]
 
-        # Snapshot current trophies for all tracked players
-        cursor.execute("""
-            INSERT INTO event_snapshots (event_id, player_tag, player_name, icon_url, trophies_start)
-            SELECT %s, tag, name, icon_url, highest_trophies
-            FROM players
-        """, (event_id,))
+        snapshot_values(cursor, event_id, body.metric, body.brawler_name)
 
         conn.commit()
         return {"ok": True, "event_id": event_id}
@@ -437,20 +533,15 @@ def closeEvent(event_id: int, x_admin_key: Optional[str] = Header(None)):
     try:
         ensure_events_tables(cursor)
 
-        cursor.execute("SELECT is_active FROM events WHERE id = %s", (event_id,))
+        cursor.execute("SELECT is_active, metric, brawler_name FROM events WHERE id = %s", (event_id,))
         row = cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Evento no encontrado")
         if not row[0]:
             raise HTTPException(status_code=400, detail="El evento ya está cerrado")
 
-        # Freeze final trophies for all participants
-        cursor.execute("""
-            UPDATE event_snapshots es
-            SET trophies_end = p.highest_trophies
-            FROM players p
-            WHERE es.player_tag = p.tag AND es.event_id = %s
-        """, (event_id,))
+        metric, brawler_name = row[1], row[2]
+        freeze_values(cursor, event_id, metric, brawler_name)
 
         cursor.execute("""
             UPDATE events SET is_active = FALSE, closed_at = NOW()
