@@ -7,6 +7,14 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from datetime import datetime, timezone
 from typing import Optional
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+# Limiter basado en IP del cliente
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 load_dotenv()
 
@@ -33,6 +41,7 @@ def get_conn():
 # ── EXISTING ENDPOINTS (unchanged) ───────────────────────────────────────────
 
 @app.get("/player/{player_tag}")
+@limiter.limit("30/minute")
 def ver_datos(player_tag: str):
     if not player_tag.startswith("#"):
         player_tag = "#" + player_tag
@@ -93,6 +102,7 @@ def ver_datos(player_tag: str):
 
 
 @app.get("/top/prestige")
+@limiter.limit("20/minute")
 def topPrestige():
     conn = get_conn()
     cursor = conn.cursor()
@@ -109,6 +119,7 @@ def topPrestige():
 
 
 @app.get("/top/trophies")
+@limiter.limit("20/minute")
 def topTrophies():
     conn = get_conn()
     cursor = conn.cursor()
@@ -125,6 +136,7 @@ def topTrophies():
 
 
 @app.get("/top/wins3v3")
+@limiter.limit("20/minute")
 def topWins3v3():
     conn = get_conn()
     cursor = conn.cursor()
@@ -141,6 +153,7 @@ def topWins3v3():
 
 
 @app.get("/top/winssolo")
+@limiter.limit("20/minute")
 def topWinsSolo():
     conn = get_conn()
     cursor = conn.cursor()
@@ -157,6 +170,7 @@ def topWinsSolo():
 
 
 @app.get("/top/winstreak")
+@limiter.limit("20/minute")
 def topWinstreak():
     conn = get_conn()
     cursor = conn.cursor()
@@ -173,6 +187,7 @@ def topWinstreak():
 
 
 @app.get("/top/brawler-trophies")
+@limiter.limit("20/minute")
 def topBrawlerTrophies():
     conn = get_conn()
     cursor = conn.cursor()
@@ -194,6 +209,7 @@ def topBrawlerTrophies():
 
 
 @app.get("/top/brawler/{brawler_name}")
+@limiter.limit("20/minute")
 def topBrawler(brawler_name: str, club: str = None):
     brawler_name = brawler_name.strip().upper()
 
@@ -234,6 +250,7 @@ def topBrawler(brawler_name: str, club: str = None):
 
 
 @app.get("/club/{club_num}/members")
+@limiter.limit("20/minute")
 def clubMembers(club_num: str):
     if club_num not in CLUBS:
         return {"error": "Club no encontrado"}
@@ -270,66 +287,6 @@ METRIC_PLAYER_COL = {
     "winsSolo":       "winsSolo",
     "prestige":       "total_prestige",
 }
-
-
-def ensure_events_tables(cursor):
-    """Create/migrate events tables. Safe to call on every request."""
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS events (
-            id SERIAL PRIMARY KEY,
-            title TEXT NOT NULL,
-            description TEXT,
-            reward TEXT NOT NULL,
-            metric TEXT NOT NULL,
-            brawler_name TEXT,                      -- only for brawler_trophies
-            started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            ends_at TIMESTAMPTZ NOT NULL,
-            closed_at TIMESTAMPTZ,
-            is_active BOOLEAN NOT NULL DEFAULT TRUE
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS event_snapshots (
-            id SERIAL PRIMARY KEY,
-            event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
-            player_tag TEXT NOT NULL,
-            player_name TEXT NOT NULL,
-            icon_url TEXT,
-            value_start INTEGER NOT NULL,   -- starting value of the tracked metric
-            value_end INTEGER,              -- frozen on close; NULL while active
-            UNIQUE(event_id, player_tag)
-        )
-    """)
-    # Migration: drop old metric CHECK constraint that only allowed 'trophies'
-    cursor.execute("""
-        DO $$
-        DECLARE c TEXT;
-        BEGIN
-            SELECT conname INTO c FROM pg_constraint
-            WHERE conrelid = 'events'::regclass AND contype = 'c' AND conname LIKE '%metric%';
-            IF c IS NOT NULL THEN
-                EXECUTE 'ALTER TABLE events DROP CONSTRAINT ' || quote_ident(c);
-            END IF;
-        END $$
-    """)
-    # Migration: add brawler_name column if an older version of the table exists
-    cursor.execute("""
-        ALTER TABLE events ADD COLUMN IF NOT EXISTS brawler_name TEXT
-    """)
-    # Migration: rename legacy trophies_start/trophies_end columns if they exist
-    cursor.execute("""
-        DO $$
-        BEGIN
-            IF EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_name='event_snapshots' AND column_name='trophies_start'
-            ) THEN
-                ALTER TABLE event_snapshots RENAME COLUMN trophies_start TO value_start;
-                ALTER TABLE event_snapshots RENAME COLUMN trophies_end   TO value_end;
-            END IF;
-        END $$
-    """)
-
 
 def check_admin(x_admin_key: Optional[str]):
     admin_key = os.getenv("ADMIN_KEY", "")
@@ -441,6 +398,7 @@ def compute_results(cursor, event_id: int, metric: str, brawler_name: Optional[s
 # ── EVENTS: PUBLIC ENDPOINTS ─────────────────────────────────────────────────
 
 @app.get("/events")
+@limiter.limit("10/minute")
 def getEvents():
     conn = get_conn()
     cursor = conn.cursor()
@@ -575,6 +533,7 @@ def closeEvent(event_id: int, x_admin_key: Optional[str] = Header(None)):
 # ── STATUS ────────────────────────────────────────────────────────────────────
 
 @app.get("/status")
+@limiter.limit("10/minute")
 def getStatus():
     """Devuelve el timestamp del último dato guardado en la DB."""
     conn = get_conn()
