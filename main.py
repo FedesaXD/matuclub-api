@@ -1,7 +1,7 @@
 import os
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -42,7 +42,7 @@ def get_conn():
 
 @app.get("/player/{player_tag}")
 @limiter.limit("30/minute")
-def ver_datos(player_tag: str):
+def ver_datos(request: Request, player_tag: str):
     if not player_tag.startswith("#"):
         player_tag = "#" + player_tag
 
@@ -103,7 +103,7 @@ def ver_datos(player_tag: str):
 
 @app.get("/top/prestige")
 @limiter.limit("20/minute")
-def topPrestige():
+def topPrestige(request: Request):
     conn = get_conn()
     cursor = conn.cursor()
     try:
@@ -120,7 +120,7 @@ def topPrestige():
 
 @app.get("/top/trophies")
 @limiter.limit("20/minute")
-def topTrophies():
+def topTrophies(request: Request):
     conn = get_conn()
     cursor = conn.cursor()
     try:
@@ -137,7 +137,7 @@ def topTrophies():
 
 @app.get("/top/wins3v3")
 @limiter.limit("20/minute")
-def topWins3v3():
+def topWins3v3(request: Request):
     conn = get_conn()
     cursor = conn.cursor()
     try:
@@ -154,7 +154,7 @@ def topWins3v3():
 
 @app.get("/top/winssolo")
 @limiter.limit("20/minute")
-def topWinsSolo():
+def topWinsSolo(request: Request):
     conn = get_conn()
     cursor = conn.cursor()
     try:
@@ -171,7 +171,7 @@ def topWinsSolo():
 
 @app.get("/top/winstreak")
 @limiter.limit("20/minute")
-def topWinstreak():
+def topWinstreak(request: Request):
     conn = get_conn()
     cursor = conn.cursor()
     try:
@@ -188,7 +188,7 @@ def topWinstreak():
 
 @app.get("/top/brawler-trophies")
 @limiter.limit("20/minute")
-def topBrawlerTrophies():
+def topBrawlerTrophies(request: Request):
     conn = get_conn()
     cursor = conn.cursor()
     try:
@@ -210,7 +210,7 @@ def topBrawlerTrophies():
 
 @app.get("/top/brawler/{brawler_name}")
 @limiter.limit("20/minute")
-def topBrawler(brawler_name: str, club: str = None):
+def topBrawler(request: Request, brawler_name: str, club: str = None):
     brawler_name = brawler_name.strip().upper()
 
     conn = get_conn()
@@ -251,7 +251,7 @@ def topBrawler(brawler_name: str, club: str = None):
 
 @app.get("/club/{club_num}/members")
 @limiter.limit("20/minute")
-def clubMembers(club_num: str):
+def clubMembers(request: Request, club_num: str):
     if club_num not in CLUBS:
         return {"error": "Club no encontrado"}
 
@@ -399,7 +399,7 @@ def compute_results(cursor, event_id: int, metric: str, brawler_name: Optional[s
 
 @app.get("/events")
 @limiter.limit("10/minute")
-def getEvents():
+def getEvents(request: Request):
     conn = get_conn()
     cursor = conn.cursor()
     try:
@@ -534,7 +534,7 @@ def closeEvent(event_id: int, x_admin_key: Optional[str] = Header(None)):
 
 @app.get("/status")
 @limiter.limit("10/minute")
-def getStatus():
+def getStatus(request: Request):
     """Devuelve el timestamp del último dato guardado en la DB."""
     conn = get_conn()
     cursor = conn.cursor()
