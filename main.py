@@ -41,9 +41,17 @@ def ver_datos(player_tag: str):
     cursor = conn.cursor()
 
     try:
+        # Asegurar que las columnas de ranked existen (migración automática)
+        cursor.execute("""
+            ALTER TABLE players
+                ADD COLUMN IF NOT EXISTS current_ranked_points INTEGER NOT NULL DEFAULT 0,
+                ADD COLUMN IF NOT EXISTS highest_ranked_points INTEGER NOT NULL DEFAULT 0
+        """)
+
         cursor.execute("""
             SELECT name, highest_trophies, wins3v3, winsSolo,
-                   total_prestige, highestWinstreak, maxWsBrawler, club_tag, club_name, icon_url
+                   total_prestige, highestWinstreak, maxWsBrawler, club_tag, club_name, icon_url,
+                   current_ranked_points, highest_ranked_points
             FROM players WHERE tag = %s
         """, (player_tag,))
 
@@ -52,7 +60,8 @@ def ver_datos(player_tag: str):
             return {"error": "Jugador no encontrado"}
 
         (name, highest_trophies, wins3v3, winsSolo,
-         total_prestige, highest_ws, ws_brawler, club_tag, club_name, icon_url) = result
+         total_prestige, highest_ws, ws_brawler, club_tag, club_name, icon_url,
+         current_ranked_points, highest_ranked_points) = result
 
         cursor.execute("""
             SELECT timestamp, trophies, wins3v3, winsSolo, total_prestige
@@ -84,6 +93,8 @@ def ver_datos(player_tag: str):
             "club_tag": club_tag,
             "club_name": club_name,
             "icon_url": icon_url,
+            "current_ranked_points": current_ranked_points,
+            "highest_ranked_points": highest_ranked_points,
             "history": [list(h) for h in history],
             "top_brawlers": [list(b) for b in brawlers]
         }
