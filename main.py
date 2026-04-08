@@ -41,17 +41,9 @@ def ver_datos(player_tag: str):
     cursor = conn.cursor()
 
     try:
-        # Asegurar que las columnas de ranked existen (migración automática)
-        cursor.execute("""
-            ALTER TABLE players
-                ADD COLUMN IF NOT EXISTS current_ranked_points INTEGER NOT NULL DEFAULT 0,
-                ADD COLUMN IF NOT EXISTS highest_ranked_points INTEGER NOT NULL DEFAULT 0
-        """)
-
         cursor.execute("""
             SELECT name, highest_trophies, wins3v3, winsSolo,
-                   total_prestige, highestWinstreak, maxWsBrawler, club_tag, club_name, icon_url,
-                   current_ranked_points, highest_ranked_points
+                   total_prestige, highestWinstreak, maxWsBrawler, club_tag, club_name, icon_url
             FROM players WHERE tag = %s
         """, (player_tag,))
 
@@ -60,8 +52,7 @@ def ver_datos(player_tag: str):
             return {"error": "Jugador no encontrado"}
 
         (name, highest_trophies, wins3v3, winsSolo,
-         total_prestige, highest_ws, ws_brawler, club_tag, club_name, icon_url,
-         current_ranked_points, highest_ranked_points) = result
+         total_prestige, highest_ws, ws_brawler, club_tag, club_name, icon_url) = result
 
         cursor.execute("""
             SELECT timestamp, trophies, wins3v3, winsSolo, total_prestige
@@ -93,8 +84,6 @@ def ver_datos(player_tag: str):
             "club_tag": club_tag,
             "club_name": club_name,
             "icon_url": icon_url,
-            "current_ranked_points": current_ranked_points,
-            "highest_ranked_points": highest_ranked_points,
             "history": [list(h) for h in history],
             "top_brawlers": [list(b) for b in brawlers]
         }
@@ -578,6 +567,25 @@ def closeEvent(event_id: int, x_admin_key: Optional[str] = Header(None)):
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# ── STATUS ────────────────────────────────────────────────────────────────────
+
+@app.get("/status")
+def getStatus():
+    """Devuelve el timestamp del último dato guardado en la DB."""
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT MAX(timestamp) FROM player_stats_history
+        """)
+        row = cursor.fetchone()
+        last_updated = row[0].isoformat() if row and row[0] else None
+        return {"last_updated": last_updated}
     finally:
         cursor.close()
         conn.close()
