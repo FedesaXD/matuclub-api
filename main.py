@@ -1,7 +1,7 @@
 import os
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -42,7 +42,7 @@ def get_conn():
 
 @app.get("/player/{player_tag}")
 @limiter.limit("30/minute")
-def ver_datos(request: Request, player_tag: str):
+def ver_datos(player_tag: str):
     if not player_tag.startswith("#"):
         player_tag = "#" + player_tag
 
@@ -101,16 +101,23 @@ def ver_datos(request: Request, player_tag: str):
         conn.close()
 
 
+def _club_filter(club: Optional[str]):
+    """Devuelve (WHERE clause, params) para filtrar por club si corresponde."""
+    if club and club in CLUBS:
+        return "WHERE club_tag = %s", (CLUBS[club],)
+    return "", ()
+
+
 @app.get("/top/prestige")
 @limiter.limit("20/minute")
-def topPrestige(request: Request):
-    conn = get_conn()
-    cursor = conn.cursor()
+def topPrestige(request: Request, club: Optional[str] = None):
+    where, params = _club_filter(club)
+    conn = get_conn(); cursor = conn.cursor()
     try:
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT tag, name, total_prestige
-            FROM players ORDER BY total_prestige DESC LIMIT 50
-        """)
+            FROM players {where} ORDER BY total_prestige DESC LIMIT 50
+        """, params)
         rows = cursor.fetchall()
         return [{"rank": i+1, "tag": t, "name": n, "value": v}
                 for i, (t, n, v) in enumerate(rows)]
@@ -120,14 +127,14 @@ def topPrestige(request: Request):
 
 @app.get("/top/trophies")
 @limiter.limit("20/minute")
-def topTrophies(request: Request):
-    conn = get_conn()
-    cursor = conn.cursor()
+def topTrophies(request: Request, club: Optional[str] = None):
+    where, params = _club_filter(club)
+    conn = get_conn(); cursor = conn.cursor()
     try:
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT tag, name, highest_trophies
-            FROM players ORDER BY highest_trophies DESC LIMIT 50
-        """)
+            FROM players {where} ORDER BY highest_trophies DESC LIMIT 50
+        """, params)
         rows = cursor.fetchall()
         return [{"rank": i+1, "tag": t, "name": n, "value": v}
                 for i, (t, n, v) in enumerate(rows)]
@@ -137,14 +144,14 @@ def topTrophies(request: Request):
 
 @app.get("/top/wins3v3")
 @limiter.limit("20/minute")
-def topWins3v3(request: Request):
-    conn = get_conn()
-    cursor = conn.cursor()
+def topWins3v3(request: Request, club: Optional[str] = None):
+    where, params = _club_filter(club)
+    conn = get_conn(); cursor = conn.cursor()
     try:
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT tag, name, wins3v3
-            FROM players ORDER BY wins3v3 DESC LIMIT 50
-        """)
+            FROM players {where} ORDER BY wins3v3 DESC LIMIT 50
+        """, params)
         rows = cursor.fetchall()
         return [{"rank": i+1, "tag": t, "name": n, "value": v}
                 for i, (t, n, v) in enumerate(rows)]
@@ -154,14 +161,14 @@ def topWins3v3(request: Request):
 
 @app.get("/top/winssolo")
 @limiter.limit("20/minute")
-def topWinsSolo(request: Request):
-    conn = get_conn()
-    cursor = conn.cursor()
+def topWinsSolo(request: Request, club: Optional[str] = None):
+    where, params = _club_filter(club)
+    conn = get_conn(); cursor = conn.cursor()
     try:
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT tag, name, winsSolo
-            FROM players ORDER BY winsSolo DESC LIMIT 50
-        """)
+            FROM players {where} ORDER BY winsSolo DESC LIMIT 50
+        """, params)
         rows = cursor.fetchall()
         return [{"rank": i+1, "tag": t, "name": n, "value": v}
                 for i, (t, n, v) in enumerate(rows)]
@@ -171,14 +178,14 @@ def topWinsSolo(request: Request):
 
 @app.get("/top/winstreak")
 @limiter.limit("20/minute")
-def topWinstreak(request: Request):
-    conn = get_conn()
-    cursor = conn.cursor()
+def topWinstreak(request: Request, club: Optional[str] = None):
+    where, params = _club_filter(club)
+    conn = get_conn(); cursor = conn.cursor()
     try:
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT tag, name, highestWinstreak, maxWsBrawler
-            FROM players ORDER BY highestWinstreak DESC LIMIT 50
-        """)
+            FROM players {where} ORDER BY highestWinstreak DESC LIMIT 50
+        """, params)
         rows = cursor.fetchall()
         return [{"rank": i+1, "tag": t, "name": n, "value": v, "brawler": b}
                 for i, (t, n, v, b) in enumerate(rows)]
@@ -188,19 +195,20 @@ def topWinstreak(request: Request):
 
 @app.get("/top/brawler-trophies")
 @limiter.limit("20/minute")
-def topBrawlerTrophies(request: Request):
-    conn = get_conn()
-    cursor = conn.cursor()
+def topBrawlerTrophies(request: Request, club: Optional[str] = None):
+    where_p = "WHERE p.club_tag = %s AND" if (club and club in CLUBS) else "WHERE"
+    params_pre = (CLUBS[club],) if (club and club in CLUBS) else ()
+    conn = get_conn(); cursor = conn.cursor()
     try:
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT p.tag, p.name, pb.brawler_name, pb.trophies
             FROM player_brawlers pb
             JOIN players p ON pb.player_tag = p.tag
-            WHERE (pb.player_tag, pb.trophies) IN (
+            {where_p} (pb.player_tag, pb.trophies) IN (
                 SELECT player_tag, MAX(trophies) FROM player_brawlers GROUP BY player_tag
             )
             ORDER BY pb.trophies DESC LIMIT 50
-        """)
+        """, params_pre)
         rows = cursor.fetchall()
         return [{"rank": i+1, "tag": t, "name": n, "brawler": b, "value": v}
                 for i, (t, n, b, v) in enumerate(rows)]
@@ -210,7 +218,7 @@ def topBrawlerTrophies(request: Request):
 
 @app.get("/top/brawler/{brawler_name}")
 @limiter.limit("20/minute")
-def topBrawler(request: Request, brawler_name: str, club: str = None):
+def topBrawler(brawler_name: str, club: str = None):
     brawler_name = brawler_name.strip().upper()
 
     conn = get_conn()
@@ -251,7 +259,7 @@ def topBrawler(request: Request, brawler_name: str, club: str = None):
 
 @app.get("/club/{club_num}/members")
 @limiter.limit("20/minute")
-def clubMembers(request: Request, club_num: str):
+def clubMembers(club_num: str):
     if club_num not in CLUBS:
         return {"error": "Club no encontrado"}
 
@@ -399,7 +407,7 @@ def compute_results(cursor, event_id: int, metric: str, brawler_name: Optional[s
 
 @app.get("/events")
 @limiter.limit("10/minute")
-def getEvents(request: Request):
+def getEvents():
     conn = get_conn()
     cursor = conn.cursor()
     try:
@@ -534,7 +542,7 @@ def closeEvent(event_id: int, x_admin_key: Optional[str] = Header(None)):
 
 @app.get("/status")
 @limiter.limit("10/minute")
-def getStatus(request: Request):
+def getStatus():
     """Devuelve el timestamp del último dato guardado en la DB."""
     conn = get_conn()
     cursor = conn.cursor()
