@@ -297,7 +297,6 @@ METRIC_PLAYER_COL = {
 }
 
 def ensure_events_tables(cursor):
-    """Crea/migra las tablas de eventos. Seguro de llamar en cada request."""
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS events (
             id SERIAL PRIMARY KEY,
@@ -324,7 +323,6 @@ def ensure_events_tables(cursor):
             UNIQUE(event_id, player_tag)
         )
     """)
-    # Migraciones para versiones anteriores de la tabla
     cursor.execute("""
         DO $$
         DECLARE c TEXT;
@@ -611,3 +609,191 @@ def getStatus(request: Request):
     finally:
         cursor.close()
         conn.close()
+
+
+# ── JUGADOR DEL DÍA ───────────────────────────────────────────────────────────
+# Sistema de puntos:
+#   1 trofeo ganado      = 1 punto
+#   1 victoria (3v3/solo) = 4 puntos
+#   1 prestige subido    = 80 puntos
+#
+# Se compara el primer snapshot del día vs el último snapshot del día anterior
+# (o el último snapshot disponible antes del día) para calcular el delta.
+# Se guarda el resultado en la tabla player_of_day para historial de 7 días.
+
+def ensure_player_of_day_table(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS player_of_day (
+            day         DATE PRIMARY KEY,
+            player_tag  TEXT NOT NULL,
+            player_name TEXT NOT NULL,
+            icon_url    TEXT,
+            club_name   TEXT,
+            points      INTEGER NOT NULL,
+            delta_trophies  INTEGER NOT NULL DEFAULT 0,
+            delta_wins3v3   INTEGER NOT NULL DEFAULT 0,
+            delta_winsSolo  INTEGER NOT NULL DEFAULT 0,
+            delta_prestige  INTEGER NOT NULL DEFAULT 0,
+            computed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+
+
+@app.get("/player-of-day")
+@limiter.limit("20/minute")
+def getPlayerOfDay(request: Request):
+    """
+    Devuelve el jugador del día actual y el historial de los últimos 7 días.
+    Si el día actual no fue calculado todavía, lo calcula en el momento.
+    """
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        ensure_player_of_day_table(cursor)
+        conn.commit()
+
+        # Fecha de hoy en UY (UTC-3)
+        from datetime import date, timedelta
+        today = (datetime.now(timezone.utc) - timedelta(hours=3)).date()
+
+        # Intentar calcular el jugador de hoy si no existe
+        cursor.execute("SELECT 1 FROM player_of_day WHERE day = %s", (today,))
+        if not cursor.fetchone():
+            _compute_and_save_player_of_day(cursor, today)
+            conn.commit()
+
+        # Traer los últimos 7 días
+        cursor.execute("""
+            SELECT day, player_tag, player_name, icon_url, club_name,
+                   points, delta_trophies, delta_wins3v3, delta_winsSolo, delta_prestige
+            FROM player_of_day
+            WHERE day >= %s
+            ORDER BY day DESC
+            LIMIT 7
+        """, (today - timedelta(days=6),))
+
+        rows = cursor.fetchall()
+        result = []
+        for row in rows:
+            (day, tag, name, icon_url, club_name,
+             points, dt, dw3, dws, dp) = row
+            result.append({
+                "day":            day.isoformat(),
+                "is_today":       day == today,
+                "player_tag":     tag,
+                "player_name":    name,
+                "icon_url":       icon_url,
+                "club_name":      club_name,
+                "points":         points,
+                "delta_trophies": dt,
+                "delta_wins3v3":  dw3,
+                "delta_winsSolo": dws,
+                "delta_prestige": dp,
+            })
+        return result
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def _compute_and_save_player_of_day(cursor, day):
+    """
+    Calcula el jugador del día para `day` comparando snapshots
+    del historial y guarda el resultado en player_of_day.
+    """
+    from datetime import date, timedelta
+    import pytz
+
+    day_start = datetime(day.year, day.month, day.day,
+                         3, 0, 0, tzinfo=timezone.utc)   # 00:00 UY = 03:00 UTC
+    day_end   = day_start + timedelta(hours=24)
+    prev_end  = day_start   # = inicio del día actual = fin del día anterior
+
+    # Para cada jugador: valor al INICIO del día (o último antes) y al FINAL del día
+    cursor.execute("""
+        WITH ranked AS (
+            SELECT
+                player_tag,
+                trophies,
+                wins3v3,
+                winsSolo,
+                total_prestige,
+                timestamp,
+                ROW_NUMBER() OVER (
+                    PARTITION BY player_tag
+                    ORDER BY timestamp ASC
+                ) AS rn_asc,
+                ROW_NUMBER() OVER (
+                    PARTITION BY player_tag
+                    ORDER BY timestamp DESC
+                ) AS rn_desc
+            FROM player_stats_history
+            WHERE timestamp >= %s AND timestamp < %s
+        ),
+        day_first AS (
+            SELECT player_tag, trophies, wins3v3, winsSolo, total_prestige
+            FROM ranked WHERE rn_asc = 1
+        ),
+        day_last AS (
+            SELECT player_tag, trophies, wins3v3, winsSolo, total_prestige
+            FROM ranked WHERE rn_desc = 1
+        ),
+        -- Último snapshot ANTES del inicio del día (referencia base)
+        prev_last AS (
+            SELECT DISTINCT ON (player_tag)
+                player_tag, trophies, wins3v3, winsSolo, total_prestige
+            FROM player_stats_history
+            WHERE timestamp < %s
+            ORDER BY player_tag, timestamp DESC
+        )
+        SELECT
+            dl.player_tag,
+            -- Si hay snapshots del día usamos first→last, sino comparamos con prev
+            COALESCE(dl.trophies, pf.trophies)    - COALESCE(df.trophies, pf.trophies, 0)    AS dt,
+            COALESCE(dl.wins3v3, pf.wins3v3)      - COALESCE(df.wins3v3,  pf.wins3v3,  0)    AS dw3,
+            COALESCE(dl.winsSolo, pf.winsSolo)    - COALESCE(df.winsSolo, pf.winsSolo, 0)    AS dws,
+            COALESCE(dl.total_prestige, pf.total_prestige) - COALESCE(df.total_prestige, pf.total_prestige, 0) AS dp
+        FROM day_last dl
+        LEFT JOIN day_first df USING (player_tag)
+        LEFT JOIN prev_last  pf USING (player_tag)
+    """, (day_start, day_end, day_start))
+
+    deltas = cursor.fetchall()
+    if not deltas:
+        return  # Sin datos para este día, no guardamos nada
+
+    # Calcular puntos y elegir ganador
+    best = None
+    best_points = -1
+    for (tag, dt, dw3, dws, dp) in deltas:
+        dt  = max(0, dt  or 0)
+        dw3 = max(0, dw3 or 0)
+        dws = max(0, dws or 0)
+        dp  = max(0, dp  or 0)
+        points = dt * 1 + (dw3 + dws) * 4 + dp * 80
+        if points > best_points:
+            best_points = points
+            best = (tag, dt, dw3, dws, dp, points)
+
+    if not best or best_points == 0:
+        return  # Nadie progresó ese día
+
+    tag, dt, dw3, dws, dp, points = best
+
+    # Traer info del jugador
+    cursor.execute("""
+        SELECT name, icon_url, club_name FROM players WHERE tag = %s
+    """, (tag,))
+    row = cursor.fetchone()
+    if not row:
+        return
+    name, icon_url, club_name = row
+
+    cursor.execute("""
+        INSERT INTO player_of_day
+            (day, player_tag, player_name, icon_url, club_name,
+             points, delta_trophies, delta_wins3v3, delta_winsSolo, delta_prestige)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (day) DO NOTHING
+    """, (day, tag, name, icon_url, club_name, points, dt, dw3, dws, dp))
