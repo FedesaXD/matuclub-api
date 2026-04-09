@@ -296,6 +296,61 @@ METRIC_PLAYER_COL = {
     "prestige":       "total_prestige",
 }
 
+def ensure_events_tables(cursor):
+    """Crea/migra las tablas de eventos. Seguro de llamar en cada request."""
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            id SERIAL PRIMARY KEY,
+            title TEXT NOT NULL,
+            description TEXT,
+            reward TEXT NOT NULL,
+            metric TEXT NOT NULL,
+            brawler_name TEXT,
+            started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            ends_at TIMESTAMPTZ NOT NULL,
+            closed_at TIMESTAMPTZ,
+            is_active BOOLEAN NOT NULL DEFAULT TRUE
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS event_snapshots (
+            id SERIAL PRIMARY KEY,
+            event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+            player_tag TEXT NOT NULL,
+            player_name TEXT NOT NULL,
+            icon_url TEXT,
+            value_start INTEGER NOT NULL,
+            value_end INTEGER,
+            UNIQUE(event_id, player_tag)
+        )
+    """)
+    # Migraciones para versiones anteriores de la tabla
+    cursor.execute("""
+        DO $$
+        DECLARE c TEXT;
+        BEGIN
+            SELECT conname INTO c FROM pg_constraint
+            WHERE conrelid = 'events'::regclass AND contype = 'c' AND conname LIKE '%metric%';
+            IF c IS NOT NULL THEN
+                EXECUTE 'ALTER TABLE events DROP CONSTRAINT ' || quote_ident(c);
+            END IF;
+        END $$
+    """)
+    cursor.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS brawler_name TEXT")
+    cursor.execute("""
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name='event_snapshots' AND column_name='trophies_start'
+            ) THEN
+                ALTER TABLE event_snapshots RENAME COLUMN trophies_start TO value_start;
+                ALTER TABLE event_snapshots RENAME COLUMN trophies_end   TO value_end;
+            END IF;
+        END $$
+    """)
+
+
 def check_admin(x_admin_key: Optional[str]):
     admin_key = os.getenv("ADMIN_KEY", "")
     if not admin_key or x_admin_key != admin_key:
