@@ -703,7 +703,6 @@ def _compute_and_save_player_of_day(cursor, day):
     del historial y guarda el resultado en player_of_day.
     """
     from datetime import date, timedelta
-    import pytz
 
     day_start = datetime(day.year, day.month, day.day,
                          3, 0, 0, tzinfo=timezone.utc)   # 00:00 UY = 03:00 UTC
