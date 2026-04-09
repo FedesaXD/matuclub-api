@@ -42,7 +42,7 @@ def get_conn():
 
 @app.get("/player/{player_tag}")
 @limiter.limit("30/minute")
-def ver_datos(player_tag: str):
+def ver_datos(request: Request, player_tag: str):
     if not player_tag.startswith("#"):
         player_tag = "#" + player_tag
 
