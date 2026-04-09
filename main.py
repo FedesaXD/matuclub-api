@@ -218,7 +218,7 @@ def topBrawlerTrophies(request: Request, club: Optional[str] = None):
 
 @app.get("/top/brawler/{brawler_name}")
 @limiter.limit("20/minute")
-def topBrawler(brawler_name: str, club: str = None):
+def topBrawler(request: Request, brawler_name: str, club: str = None):
     brawler_name = brawler_name.strip().upper()
 
     conn = get_conn()
@@ -259,7 +259,7 @@ def topBrawler(brawler_name: str, club: str = None):
 
 @app.get("/club/{club_num}/members")
 @limiter.limit("20/minute")
-def clubMembers(club_num: str):
+def clubMembers(request: Request, club_num: str):
     if club_num not in CLUBS:
         return {"error": "Club no encontrado"}
 
@@ -407,7 +407,7 @@ def compute_results(cursor, event_id: int, metric: str, brawler_name: Optional[s
 
 @app.get("/events")
 @limiter.limit("10/minute")
-def getEvents():
+def getEvents(request: Request):
     conn = get_conn()
     cursor = conn.cursor()
     try:
@@ -542,7 +542,7 @@ def closeEvent(event_id: int, x_admin_key: Optional[str] = Header(None)):
 
 @app.get("/status")
 @limiter.limit("10/minute")
-def getStatus():
+def getStatus(request: Request):
     """Devuelve el timestamp del último dato guardado en la DB."""
     conn = get_conn()
     cursor = conn.cursor()
