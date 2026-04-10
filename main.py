@@ -63,11 +63,25 @@ def ver_datos(request: Request, player_tag: str):
         (name, highest_trophies, wins3v3, winsSolo,
          total_prestige, highest_ws, ws_brawler, club_tag, club_name, icon_url) = result
 
+        # Muestreo uniforme de hasta 60 puntos sobre toda la historia del jugador.
+        # ROW_NUMBER() numera los snapshots cronológicamente; luego se filtra
+        # 1 de cada (total/60) filas, garantizando cobertura completa del historial.
         cursor.execute("""
+            WITH numbered AS (
+                SELECT timestamp, trophies, wins3v3, winsSolo, total_prestige,
+                       ROW_NUMBER() OVER (ORDER BY timestamp ASC) AS rn,
+                       COUNT(*) OVER ()                           AS total
+                FROM player_stats_history
+                WHERE player_tag = %s
+            )
             SELECT timestamp, trophies, wins3v3, winsSolo, total_prestige
-            FROM player_stats_history
-            WHERE player_tag = %s
+            FROM numbered
+            WHERE rn = 1
+               OR rn = total
+               OR (total > 60 AND (rn - 1) %% GREATEST(total / 60, 1) = 0)
+               OR total <= 60
             ORDER BY timestamp ASC
+            LIMIT 60
         """, (player_tag,))
         history = cursor.fetchall()
 
@@ -644,7 +658,8 @@ def ensure_player_of_day_table(cursor):
 def getPlayerOfDay(request: Request):
     """
     Devuelve el jugador del día actual y el historial de los últimos 7 días.
-    Si el día actual no fue calculado todavía, lo calcula en el momento.
+    El collector actualiza el día actual cada 30 min; el API solo lo calcula
+    como fallback si todavía no existe entrada para hoy.
     """
     conn = get_conn()
     cursor = conn.cursor()
@@ -652,18 +667,20 @@ def getPlayerOfDay(request: Request):
         ensure_player_of_day_table(cursor)
         conn.commit()
 
-        # Fecha de hoy en UY (UTC-3)
         from datetime import date, timedelta
         today = (datetime.now(timezone.utc) - timedelta(hours=3)).date()
 
-        # Calcular/actualizar el jugador de hoy siempre (por si el collector aún no corrió)
-        _compute_and_save_player_of_day(cursor, today)
-        conn.commit()
+        # Solo calcular si el collector aún no corrió hoy (fallback)
+        cursor.execute("SELECT 1 FROM player_of_day WHERE day = %s", (today,))
+        if not cursor.fetchone():
+            _compute_and_save_player_of_day(cursor, today)
+            conn.commit()
 
-        # Traer los últimos 7 días
+        # Traer los últimos 7 días, incluyendo computed_at para el frontend
         cursor.execute("""
             SELECT day, player_tag, player_name, icon_url, club_name,
-                   points, delta_trophies, delta_wins3v3, delta_winsSolo, delta_prestige
+                   points, delta_trophies, delta_wins3v3, delta_winsSolo,
+                   delta_prestige, computed_at
             FROM player_of_day
             WHERE day >= %s
             ORDER BY day DESC
@@ -674,7 +691,7 @@ def getPlayerOfDay(request: Request):
         result = []
         for row in rows:
             (day, tag, name, icon_url, club_name,
-             points, dt, dw3, dws, dp) = row
+             points, dt, dw3, dws, dp, computed_at) = row
             result.append({
                 "day":            day.isoformat(),
                 "is_today":       day == today,
@@ -687,6 +704,7 @@ def getPlayerOfDay(request: Request):
                 "delta_wins3v3":  dw3,
                 "delta_winsSolo": dws,
                 "delta_prestige": dp,
+                "last_updated":   computed_at.isoformat() if computed_at else None,
             })
         return result
 
