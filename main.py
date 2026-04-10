@@ -64,22 +64,24 @@ def ver_datos(request: Request, player_tag: str):
          total_prestige, highest_ws, ws_brawler, club_tag, club_name, icon_url) = result
 
         # Muestreo uniforme de hasta 60 puntos sobre toda la historia del jugador.
-        # ROW_NUMBER() numera los snapshots cronológicamente; luego se filtra
-        # 1 de cada (total/60) filas, garantizando cobertura completa del historial.
+        # NTILE(60) divide las filas en 60 buckets del mismo tamaño; tomamos
+        # la primera fila de cada bucket (ROW_NUMBER dentro del bucket = 1)
+        # más forzamos siempre la última fila para que el gráfico llegue al presente.
         cursor.execute("""
             WITH numbered AS (
                 SELECT timestamp, trophies, wins3v3, winsSolo, total_prestige,
-                       ROW_NUMBER() OVER (ORDER BY timestamp ASC) AS rn,
-                       COUNT(*) OVER ()                           AS total
+                       ROW_NUMBER() OVER (ORDER BY timestamp ASC)                        AS rn,
+                       COUNT(*)     OVER ()                                               AS total,
+                       NTILE(60)    OVER (ORDER BY timestamp ASC)                        AS bucket,
+                       ROW_NUMBER() OVER (PARTITION BY NTILE(60) OVER (ORDER BY timestamp ASC)
+                                         ORDER BY timestamp ASC)                         AS rn_in_bucket
                 FROM player_stats_history
                 WHERE player_tag = %s
             )
             SELECT timestamp, trophies, wins3v3, winsSolo, total_prestige
             FROM numbered
-            WHERE rn = 1
-               OR rn = total
-               OR (total > 60 AND (rn - 1) %% GREATEST(total / 60, 1) = 0)
-               OR total <= 60
+            WHERE rn_in_bucket = 1   -- primer punto de cada bucket
+               OR rn = total          -- siempre incluir el último snapshot
             ORDER BY timestamp ASC
             LIMIT 60
         """, (player_tag,))
