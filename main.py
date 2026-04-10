@@ -656,11 +656,9 @@ def getPlayerOfDay(request: Request):
         from datetime import date, timedelta
         today = (datetime.now(timezone.utc) - timedelta(hours=3)).date()
 
-        # Intentar calcular el jugador de hoy si no existe
-        cursor.execute("SELECT 1 FROM player_of_day WHERE day = %s", (today,))
-        if not cursor.fetchone():
-            _compute_and_save_player_of_day(cursor, today)
-            conn.commit()
+        # Calcular/actualizar el jugador de hoy siempre (por si el collector aún no corrió)
+        _compute_and_save_player_of_day(cursor, today)
+        conn.commit()
 
         # Traer los últimos 7 días
         cursor.execute("""
@@ -792,7 +790,18 @@ def _compute_and_save_player_of_day(cursor, day):
     cursor.execute("""
         INSERT INTO player_of_day
             (day, player_tag, player_name, icon_url, club_name,
-             points, delta_trophies, delta_wins3v3, delta_winsSolo, delta_prestige)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (day) DO NOTHING
+             points, delta_trophies, delta_wins3v3, delta_winsSolo, delta_prestige,
+             computed_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+        ON CONFLICT (day) DO UPDATE SET
+            player_tag     = EXCLUDED.player_tag,
+            player_name    = EXCLUDED.player_name,
+            icon_url       = EXCLUDED.icon_url,
+            club_name      = EXCLUDED.club_name,
+            points         = EXCLUDED.points,
+            delta_trophies = EXCLUDED.delta_trophies,
+            delta_wins3v3  = EXCLUDED.delta_wins3v3,
+            delta_winsSolo = EXCLUDED.delta_winsSolo,
+            delta_prestige = EXCLUDED.delta_prestige,
+            computed_at    = NOW()
     """, (day, tag, name, icon_url, club_name, points, dt, dw3, dws, dp))
