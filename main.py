@@ -64,24 +64,28 @@ def ver_datos(request: Request, player_tag: str):
          total_prestige, highest_ws, ws_brawler, club_tag, club_name, icon_url) = result
 
         # Muestreo uniforme de hasta 60 puntos sobre toda la historia del jugador.
-        # NTILE(60) divide las filas en 60 buckets del mismo tamaño; tomamos
-        # la primera fila de cada bucket (ROW_NUMBER dentro del bucket = 1)
-        # más forzamos siempre la última fila para que el gráfico llegue al presente.
+        # Paso 1: numerar filas y asignar bucket con NTILE en una CTE.
+        # Paso 2: en otra CTE tomar ROW_NUMBER dentro de cada bucket.
+        # Esto evita anidar window functions, que PostgreSQL no permite.
+        # Siempre se incluye la última fila (rn = total) para llegar al presente.
         cursor.execute("""
             WITH numbered AS (
                 SELECT timestamp, trophies, wins3v3, winsSolo, total_prestige,
-                       ROW_NUMBER() OVER (ORDER BY timestamp ASC)                        AS rn,
-                       COUNT(*)     OVER ()                                               AS total,
-                       NTILE(60)    OVER (ORDER BY timestamp ASC)                        AS bucket,
-                       ROW_NUMBER() OVER (PARTITION BY NTILE(60) OVER (ORDER BY timestamp ASC)
-                                         ORDER BY timestamp ASC)                         AS rn_in_bucket
+                       ROW_NUMBER() OVER (ORDER BY timestamp ASC) AS rn,
+                       COUNT(*)     OVER ()                        AS total,
+                       NTILE(60)    OVER (ORDER BY timestamp ASC) AS bucket
                 FROM player_stats_history
                 WHERE player_tag = %s
+            ),
+            bucketed AS (
+                SELECT *,
+                       ROW_NUMBER() OVER (PARTITION BY bucket ORDER BY timestamp ASC) AS rn_in_bucket
+                FROM numbered
             )
             SELECT timestamp, trophies, wins3v3, winsSolo, total_prestige
-            FROM numbered
-            WHERE rn_in_bucket = 1   -- primer punto de cada bucket
-               OR rn = total          -- siempre incluir el último snapshot
+            FROM bucketed
+            WHERE rn_in_bucket = 1  -- primer punto de cada bucket
+               OR rn = total         -- siempre incluir el último snapshot
             ORDER BY timestamp ASC
             LIMIT 60
         """, (player_tag,))
@@ -372,12 +376,28 @@ def check_admin(x_admin_key: Optional[str]):
 
 
 def auto_close_expired(cursor):
-    """Mark events as inactive if their end time has passed."""
+    """
+    Cierra eventos expirados y freezea sus valores finales.
+    Sin el freeze, compute_results usa valores live del jugador
+    y el resultado del torneo cambia después de terminar.
+    """
+    # Primero obtener los eventos que hay que cerrar
     cursor.execute("""
-        UPDATE events
-        SET is_active = FALSE, closed_at = NOW()
+        SELECT id, metric, brawler_name FROM events
         WHERE is_active = TRUE AND ends_at <= NOW()
     """)
+    to_close = cursor.fetchall()
+
+    for (event_id, metric, brawler_name) in to_close:
+        # Freeze solo los snapshots que aún no tienen value_end
+        freeze_values(cursor, event_id, metric, brawler_name)
+
+    if to_close:
+        cursor.execute("""
+            UPDATE events
+            SET is_active = FALSE, closed_at = NOW()
+            WHERE is_active = TRUE AND ends_at <= NOW()
+        """)
 
 
 def snapshot_values(cursor, event_id: int, metric: str, brawler_name: Optional[str]):
@@ -401,7 +421,11 @@ def snapshot_values(cursor, event_id: int, metric: str, brawler_name: Optional[s
 
 
 def freeze_values(cursor, event_id: int, metric: str, brawler_name: Optional[str]):
-    """Freeze final values into value_end for all participants of an event."""
+    """
+    Freeze final values into value_end for all participants of an event.
+    Solo actualiza filas con value_end IS NULL para no sobreescribir
+    snapshots ya freezeados correctamente por un cierre manual previo.
+    """
     if metric == "brawler_trophies":
         bn = (brawler_name or "").strip().upper()
         cursor.execute("""
@@ -411,6 +435,7 @@ def freeze_values(cursor, event_id: int, metric: str, brawler_name: Optional[str
             LEFT JOIN player_brawlers pb
               ON pb.player_tag = p.tag AND UPPER(pb.brawler_name) = %s
             WHERE es.player_tag = p.tag AND es.event_id = %s
+              AND es.value_end IS NULL
         """, (bn, event_id))
     else:
         col = METRIC_PLAYER_COL[metric]
@@ -419,6 +444,7 @@ def freeze_values(cursor, event_id: int, metric: str, brawler_name: Optional[str
             SET value_end = p.{col}
             FROM players p
             WHERE es.player_tag = p.tag AND es.event_id = %s
+              AND es.value_end IS NULL
         """, (event_id,))
 
 
