@@ -657,9 +657,10 @@ def ensure_player_of_day_table(cursor):
 @limiter.limit("20/minute")
 def getPlayerOfDay(request: Request):
     """
-    Devuelve el jugador del día actual y el historial de los últimos 7 días.
-    El collector actualiza el día actual cada 30 min; el API solo lo calcula
-    como fallback si todavía no existe entrada para hoy.
+    Devuelve:
+      - today_ranking: top 20 jugadores del día actual con sus deltas (calculado en vivo)
+      - history: ganadores de los últimos 7 días (sin incluir hoy)
+      - last_updated: timestamp del último cómputo del collector
     """
     conn = get_conn()
     cursor = conn.cursor()
@@ -670,31 +671,58 @@ def getPlayerOfDay(request: Request):
         from datetime import date, timedelta
         today = (datetime.now(timezone.utc) - timedelta(hours=3)).date()
 
-        # Solo calcular si el collector aún no corrió hoy (fallback)
+        # Fallback: calcular ganador de hoy si el collector aún no corrió
         cursor.execute("SELECT 1 FROM player_of_day WHERE day = %s", (today,))
         if not cursor.fetchone():
             _compute_and_save_player_of_day(cursor, today)
             conn.commit()
 
-        # Traer los últimos 7 días, incluyendo computed_at para el frontend
-        cursor.execute("""
-            SELECT day, player_tag, player_name, icon_url, club_name,
-                   points, delta_trophies, delta_wins3v3, delta_winsSolo,
-                   delta_prestige, computed_at
-            FROM player_of_day
-            WHERE day >= %s
-            ORDER BY day DESC
-            LIMIT 7
-        """, (today - timedelta(days=6),))
+        # ── Ranking de hoy en vivo (top 20 con deltas) ──────────────────
+        day_start = datetime(today.year, today.month, today.day,
+                             3, 0, 0, tzinfo=timezone.utc)
+        day_end   = day_start + timedelta(hours=24)
 
-        rows = cursor.fetchall()
-        result = []
-        for row in rows:
-            (day, tag, name, icon_url, club_name,
-             points, dt, dw3, dws, dp, computed_at) = row
-            result.append({
-                "day":            day.isoformat(),
-                "is_today":       day == today,
+        cursor.execute("""
+            WITH ranked AS (
+                SELECT player_tag, trophies, wins3v3, winssolo, total_prestige, timestamp,
+                       ROW_NUMBER() OVER (PARTITION BY player_tag ORDER BY timestamp ASC)  AS rn_asc,
+                       ROW_NUMBER() OVER (PARTITION BY player_tag ORDER BY timestamp DESC) AS rn_desc
+                FROM player_stats_history
+                WHERE timestamp >= %s AND timestamp < %s
+            ),
+            day_first AS (SELECT player_tag, trophies, wins3v3, winssolo, total_prestige FROM ranked WHERE rn_asc  = 1),
+            day_last  AS (SELECT player_tag, trophies, wins3v3, winssolo, total_prestige FROM ranked WHERE rn_desc = 1),
+            prev_last AS (
+                SELECT DISTINCT ON (player_tag) player_tag, trophies, wins3v3, winssolo, total_prestige
+                FROM player_stats_history WHERE timestamp < %s
+                ORDER BY player_tag, timestamp DESC
+            )
+            SELECT
+                dl.player_tag,
+                p.name, p.icon_url, p.club_name,
+                GREATEST(0, COALESCE(dl.trophies,       pv.trophies)       - COALESCE(df.trophies,       pv.trophies,       0)) AS dt,
+                GREATEST(0, COALESCE(dl.wins3v3,        pv.wins3v3)        - COALESCE(df.wins3v3,        pv.wins3v3,        0)) AS dw3,
+                GREATEST(0, COALESCE(dl.winssolo,       pv.winssolo)       - COALESCE(df.winssolo,       pv.winssolo,       0)) AS dws,
+                GREATEST(0, COALESCE(dl.total_prestige, pv.total_prestige) - COALESCE(df.total_prestige, pv.total_prestige, 0)) AS dp
+            FROM day_last dl
+            LEFT JOIN day_first df USING (player_tag)
+            LEFT JOIN prev_last  pv USING (player_tag)
+            JOIN players p ON p.tag = dl.player_tag
+            ORDER BY (
+                GREATEST(0, COALESCE(dl.trophies,       pv.trophies)       - COALESCE(df.trophies,       pv.trophies,       0)) * 1 +
+                GREATEST(0, COALESCE(dl.wins3v3,        pv.wins3v3)        - COALESCE(df.wins3v3,        pv.wins3v3,        0)) * 4 +
+                GREATEST(0, COALESCE(dl.winssolo,       pv.winssolo)       - COALESCE(df.winssolo,       pv.winssolo,       0)) * 4 +
+                GREATEST(0, COALESCE(dl.total_prestige, pv.total_prestige) - COALESCE(df.total_prestige, pv.total_prestige, 0)) * 80
+            ) DESC
+            LIMIT 20
+        """, (day_start, day_end, day_start))
+
+        today_rows = cursor.fetchall()
+        today_ranking = []
+        for i, (tag, name, icon_url, club_name, dt, dw3, dws, dp) in enumerate(today_rows):
+            points = dt * 1 + (dw3 + dws) * 4 + dp * 80
+            today_ranking.append({
+                "rank":           i + 1,
                 "player_tag":     tag,
                 "player_name":    name,
                 "icon_url":       icon_url,
@@ -704,9 +732,50 @@ def getPlayerOfDay(request: Request):
                 "delta_wins3v3":  dw3,
                 "delta_winsSolo": dws,
                 "delta_prestige": dp,
-                "last_updated":   computed_at.isoformat() if computed_at else None,
             })
-        return result
+
+        # ── Historial: ganadores de días anteriores (últimos 7, sin hoy) ─
+        cursor.execute("""
+            SELECT day, player_tag, player_name, icon_url, club_name,
+                   points, delta_trophies, delta_wins3v3, delta_winsSolo,
+                   delta_prestige, computed_at
+            FROM player_of_day
+            WHERE day >= %s AND day < %s
+            ORDER BY day DESC
+            LIMIT 7
+        """, (today - timedelta(days=7), today))
+
+        history = []
+        last_updated = None
+        for row in cursor.fetchall():
+            (day, tag, name, icon_url, club_name,
+             points, dt, dw3, dws, dp, computed_at) = row
+            if last_updated is None and computed_at:
+                last_updated = computed_at.isoformat()
+            history.append({
+                "day":            day.isoformat(),
+                "player_tag":     tag,
+                "player_name":    name,
+                "icon_url":       icon_url,
+                "club_name":      club_name,
+                "points":         points,
+                "delta_trophies": dt,
+                "delta_wins3v3":  dw3,
+                "delta_winsSolo": dws,
+                "delta_prestige": dp,
+            })
+
+        # last_updated: usar computed_at del registro de hoy si existe
+        cursor.execute("SELECT computed_at FROM player_of_day WHERE day = %s", (today,))
+        row = cursor.fetchone()
+        if row and row[0]:
+            last_updated = row[0].isoformat()
+
+        return {
+            "last_updated":   last_updated,
+            "today_ranking":  today_ranking,
+            "history":        history,
+        }
 
     finally:
         cursor.close()
