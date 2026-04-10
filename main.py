@@ -653,6 +653,47 @@ def ensure_player_of_day_table(cursor):
     """)
 
 
+@app.get("/player-of-day/winners")
+@limiter.limit("20/minute")
+def getPlayerOfDayWinners(request: Request):
+    """
+    Top 20 jugadores que más veces fueron jugador del día,
+    ordenados por cantidad de victorias descendente.
+    """
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        ensure_player_of_day_table(cursor)
+        cursor.execute("""
+            SELECT
+                p.tag,
+                pod.player_name,
+                p.icon_url,
+                p.club_name,
+                COUNT(*) AS wins
+            FROM player_of_day pod
+            JOIN players p ON p.tag = pod.player_tag
+            GROUP BY p.tag, pod.player_name, p.icon_url, p.club_name
+            ORDER BY wins DESC
+            LIMIT 20
+        """)
+        rows = cursor.fetchall()
+        return [
+            {
+                "rank":        i + 1,
+                "player_tag":  tag,
+                "player_name": name,
+                "icon_url":    icon_url,
+                "club_name":   club_name,
+                "wins":        wins,
+            }
+            for i, (tag, name, icon_url, club_name, wins) in enumerate(rows)
+        ]
+    finally:
+        cursor.close()
+        conn.close()
+
+
 @app.get("/player-of-day")
 @limiter.limit("20/minute")
 def getPlayerOfDay(request: Request):
