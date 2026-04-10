@@ -1,8 +1,11 @@
 import os
+import re
 import psycopg2
 import psycopg2.extras
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from datetime import datetime, timezone
@@ -14,16 +17,36 @@ from slowapi.errors import RateLimitExceeded
 
 load_dotenv()
 
-app = FastAPI()
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)  # deshabilitar docs públicas
 
+# ── Seguridad: headers en cada respuesta ─────────────────────────────────────
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        return response
+
+app.add_middleware(SecurityHeadersMiddleware)
+
+# ── CORS: solo permitir el origen de GitHub Pages ────────────────────────────
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "PATCH"],
+    allow_headers=["Content-Type", "X-Admin-Key"],
 )
-# Limiter basado en IP del cliente
-limiter = Limiter(key_func=get_remote_address)
+
+# ── Rate limiter: leer IP real detrás del proxy de Render ────────────────────
+def get_real_ip(request: Request) -> str:
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+limiter = Limiter(key_func=get_real_ip)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -43,8 +66,12 @@ def get_conn():
 @app.get("/player/{player_tag}")
 @limiter.limit("30/minute")
 def ver_datos(request: Request, player_tag: str):
+    player_tag = player_tag.strip().upper()
     if not player_tag.startswith("#"):
         player_tag = "#" + player_tag
+    # Tags de Brawl Stars: # seguido de 3-15 caracteres alfanuméricos (0-9, A-Z, sin I,O,U)
+    if not re.match(r"^#[0-9A-Z]{3,15}$", player_tag):
+        raise HTTPException(status_code=400, detail="Tag de jugador inválido")
 
     conn = get_conn()
     cursor = conn.cursor()
@@ -553,7 +580,8 @@ class CreateEventBody(BaseModel):
 
 
 @app.post("/events")
-def createEvent(body: CreateEventBody, x_admin_key: Optional[str] = Header(None)):
+@limiter.limit("5/minute")
+def createEvent(request: Request, body: CreateEventBody, x_admin_key: Optional[str] = Header(None)):
     check_admin(x_admin_key)
 
     if body.metric not in VALID_METRICS:
@@ -598,7 +626,8 @@ def createEvent(body: CreateEventBody, x_admin_key: Optional[str] = Header(None)
 
 
 @app.patch("/events/{event_id}/close")
-def closeEvent(event_id: int, x_admin_key: Optional[str] = Header(None)):
+@limiter.limit("5/minute")
+def closeEvent(request: Request, event_id: int, x_admin_key: Optional[str] = Header(None)):
     check_admin(x_admin_key)
 
     conn = get_conn()
