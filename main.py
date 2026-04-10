@@ -19,25 +19,31 @@ load_dotenv()
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)  # deshabilitar docs públicas
 
-# ── Seguridad: headers en cada respuesta ─────────────────────────────────────
-class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        response = await call_next(request)
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-        return response
-
-app.add_middleware(SecurityHeadersMiddleware)
-
-# ── CORS: solo permitir el origen de GitHub Pages ────────────────────────────
+# ── CORS: debe agregarse ÚLTIMO para ejecutarse PRIMERO (orden inverso en Starlette) ──
+# Maneja los preflight OPTIONS antes que cualquier otro middleware.
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["GET", "POST", "PATCH"],
-    allow_headers=["Content-Type", "X-Admin-Key"],
+    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+    allow_headers=["Content-Type", "X-Admin-Key", "Authorization"],
+    allow_credentials=False,
+    max_age=600,  # cachear preflight 10 minutos
 )
+
+# ── Security headers: se agrega antes para ejecutarse DESPUÉS de CORS ────────
+# Así no interfiere con las respuestas preflight OPTIONS.
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        # No agregar headers en preflight OPTIONS — CORS los maneja
+        if request.method != "OPTIONS":
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        return response
+
+app.add_middleware(SecurityHeadersMiddleware)
 
 # ── Rate limiter: leer IP real detrás del proxy de Render ────────────────────
 def get_real_ip(request: Request) -> str:
