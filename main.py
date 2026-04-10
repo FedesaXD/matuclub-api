@@ -3,6 +3,7 @@ import re
 import psycopg2
 import psycopg2.extras
 from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -55,6 +56,24 @@ def get_real_ip(request: Request) -> str:
 limiter = Limiter(key_func=get_real_ip)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Devuelve errores HTTP conocidos con su código y mensaje — sin stack trace."""
+    return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    """
+    Captura cualquier error inesperado (DB caída, bug, etc.) y devuelve
+    un mensaje genérico. Nunca expone detalles internos al cliente.
+    """
+    import logging
+    logging.error(f"Unhandled error on {request.method} {request.url.path}: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Error interno del servidor. Intentá de nuevo en unos segundos."}
+    )
 
 CLUBS = {
     "1": "#282Y2LR8R",
@@ -625,7 +644,7 @@ def createEvent(request: Request, body: CreateEventBody, x_admin_key: Optional[s
         return {"ok": True, "event_id": event_id}
     except Exception as e:
         conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Error al crear el evento")
     finally:
         cursor.close()
         conn.close()
@@ -662,7 +681,7 @@ def closeEvent(request: Request, event_id: int, x_admin_key: Optional[str] = Hea
         raise
     except Exception as e:
         conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Error al cerrar el evento")
     finally:
         cursor.close()
         conn.close()
