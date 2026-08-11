@@ -18,7 +18,7 @@ from slowapi.errors import RateLimitExceeded
 
 load_dotenv()
 
-app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)  # deshabilitar docs públicas
+app = FastAPI(docs_url="/docs")
 
 # ── CORS: debe agregarse ÚLTIMO para ejecutarse PRIMERO (orden inverso en Starlette) ──
 # Maneja los preflight OPTIONS antes que cualquier otro middleware.
