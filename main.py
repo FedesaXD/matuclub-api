@@ -1,8 +1,13 @@
 import os
 import re
+import random
+import secrets
+import bcrypt
+import jwt as pyjwt
 import psycopg2
+import psycopg2.errors
 import psycopg2.extras
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header, Request, Depends
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -10,7 +15,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -84,6 +89,210 @@ CLUBS = {
 
 def get_conn():
     return psycopg2.connect(os.getenv("DATABASE_URL"), connect_timeout=10)
+
+
+# ── AUTH: config ──────────────────────────────────────────────────────────
+# JWT_SECRET debe fijarse como variable de entorno en Render para que las
+# sesiones sobrevivan a reinicios/deploys. Si no está seteada, generamos una
+# de emergencia para que el servicio no rompa, pero avisamos por log: todas
+# las sesiones existentes quedarán invalidadas en cada reinicio del server.
+JWT_SECRET = os.getenv("JWT_SECRET") or secrets.token_hex(32)
+if not os.getenv("JWT_SECRET"):
+    import logging
+    logging.warning(
+        "JWT_SECRET no está seteada como variable de entorno: usando una clave "
+        "temporal generada en memoria. Las sesiones de usuario se invalidarán "
+        "en cada reinicio del servidor. Configurá JWT_SECRET en Render."
+    )
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_DAYS = 30
+MAX_LOGIN_ATTEMPTS = 8
+LOGIN_LOCKOUT_MINUTES = 15
+
+USERNAME_RE = re.compile(r"^[a-zA-Z0-9_]{3,20}$")
+PASSWORD_RE = re.compile(r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$")
+TAG_RE = re.compile(r"^#[0-9A-Z]{3,15}$")
+
+
+def normalize_tag(tag: str) -> str:
+    tag = (tag or "").strip().upper()
+    if not tag.startswith("#"):
+        tag = "#" + tag
+    return tag
+
+
+def create_access_token(user_id: int, username: str, tag: str) -> str:
+    from datetime import timedelta
+    payload = {
+        "sub": str(user_id),
+        "username": username,
+        "tag": tag,
+        "exp": datetime.now(timezone.utc) + timedelta(days=JWT_EXPIRE_DAYS),
+        "iat": datetime.now(timezone.utc),
+    }
+    return pyjwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def get_current_user(authorization: Optional[str] = Header(None)):
+    """Dependencia de FastAPI: valida el JWT del header Authorization: Bearer <token>."""
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="No autenticado")
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        payload = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except pyjwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Tu sesión expiró, iniciá sesión de nuevo")
+    except pyjwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Sesión inválida")
+    return payload
+
+
+# ── AUTH: tabla y endpoints ──────────────────────────────────────────────────
+# Reemplaza el login/registro anterior (que vivía en storage temporal del
+# navegador). Las contraseñas se hashean con bcrypt (nunca se guardan ni se
+# transmiten en texto plano más que en el body HTTPS del request original) y
+# cada cuenta queda ligada a una tag de Brawl Stars única. El login devuelve
+# un JWT que el front-end guarda y reenvía en el header Authorization.
+
+def ensure_users_table(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id               SERIAL PRIMARY KEY,
+            username         TEXT NOT NULL,
+            username_lower   TEXT NOT NULL UNIQUE,
+            player_tag       TEXT NOT NULL UNIQUE,
+            password_hash    TEXT NOT NULL,
+            created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_login_at    TIMESTAMPTZ,
+            failed_attempts  INTEGER NOT NULL DEFAULT 0,
+            locked_until     TIMESTAMPTZ
+        )
+    """)
+
+
+class RegisterBody(BaseModel):
+    username: str
+    tag: str
+    password: str
+
+
+class LoginBody(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/auth/register")
+@limiter.limit("5/minute")
+def register(request: Request, body: RegisterBody):
+    username = (body.username or "").strip()
+    if not USERNAME_RE.match(username):
+        raise HTTPException(status_code=400, detail="Usá entre 3 y 20 caracteres: letras, números o guion bajo.")
+
+    tag = normalize_tag(body.tag)
+    if not TAG_RE.match(tag):
+        raise HTTPException(status_code=400, detail="Tag de Brawl Stars inválida.")
+
+    if not PASSWORD_RE.match(body.password or ""):
+        raise HTTPException(status_code=400, detail="Mínimo 8 caracteres, con mayúsculas, minúsculas y números.")
+
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        ensure_users_table(cursor)
+
+        cursor.execute("SELECT 1 FROM users WHERE username_lower = %s", (username.lower(),))
+        if cursor.fetchone():
+            raise HTTPException(status_code=409, detail="Ese nombre de usuario ya está en uso.")
+        cursor.execute("SELECT 1 FROM users WHERE player_tag = %s", (tag,))
+        if cursor.fetchone():
+            raise HTTPException(status_code=409, detail="Esa tag de Brawl Stars ya está registrada por otro usuario.")
+
+        pw_hash = bcrypt.hashpw(body.password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+        try:
+            cursor.execute("""
+                INSERT INTO users (username, username_lower, player_tag, password_hash)
+                VALUES (%s, %s, %s, %s) RETURNING id
+            """, (username, username.lower(), tag, pw_hash))
+            user_id = cursor.fetchone()[0]
+            conn.commit()
+        except psycopg2.errors.UniqueViolation:
+            conn.rollback()
+            # Carrera entre dos requests simultáneos: alguien ganó la unicidad primero.
+            raise HTTPException(status_code=409, detail="Ese usuario o esa tag ya están registrados.")
+
+        token = create_access_token(user_id, username, tag)
+        return {"token": token, "username": username, "tag": tag}
+    except HTTPException:
+        raise
+    except Exception:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail="No se pudo completar el registro.")
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.post("/auth/login")
+@limiter.limit("10/minute")
+def login(request: Request, body: LoginBody):
+    username = (body.username or "").strip().lower()
+    generic_error = HTTPException(status_code=401, detail="Usuario o contraseña incorrectos.")
+    if not username or not body.password:
+        raise generic_error
+
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        ensure_users_table(cursor)
+        cursor.execute("""
+            SELECT id, username, player_tag, password_hash, failed_attempts, locked_until
+            FROM users WHERE username_lower = %s
+        """, (username,))
+        row = cursor.fetchone()
+        if not row:
+            raise generic_error
+        user_id, real_username, tag, pw_hash, failed_attempts, locked_until = row
+
+        if locked_until and locked_until > datetime.now(timezone.utc):
+            raise HTTPException(
+                status_code=429,
+                detail="Cuenta bloqueada temporalmente por demasiados intentos fallidos. Probá de nuevo en unos minutos."
+            )
+
+        if not bcrypt.checkpw(body.password.encode("utf-8"), pw_hash.encode("utf-8")):
+            from datetime import timedelta
+            failed_attempts += 1
+            reached_limit = failed_attempts >= MAX_LOGIN_ATTEMPTS
+            new_lock = (datetime.now(timezone.utc) + timedelta(minutes=LOGIN_LOCKOUT_MINUTES)) if reached_limit else None
+            # Al bloquear, reiniciamos el contador para que el próximo ciclo de
+            # intentos (una vez pasado el bloqueo) empiece de cero.
+            cursor.execute("""
+                UPDATE users SET failed_attempts = %s, locked_until = %s WHERE id = %s
+            """, (0 if reached_limit else failed_attempts, new_lock, user_id))
+            conn.commit()
+            raise generic_error
+
+        cursor.execute("""
+            UPDATE users SET failed_attempts = 0, locked_until = NULL, last_login_at = NOW() WHERE id = %s
+        """, (user_id,))
+        conn.commit()
+
+        token = create_access_token(user_id, real_username, tag)
+        return {"token": token, "username": real_username, "tag": tag}
+    except HTTPException:
+        raise
+    except Exception:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail="No se pudo iniciar sesión.")
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.get("/auth/me")
+@limiter.limit("30/minute")
+def me(request: Request, user=Depends(get_current_user)):
+    return {"username": user["username"], "tag": user["tag"]}
 
 
 # ── EXISTING ENDPOINTS (unchanged) ───────────────────────────────────────────
@@ -559,6 +768,7 @@ def getEvents(request: Request):
     cursor = conn.cursor()
     try:
         ensure_events_tables(cursor)
+        ensure_raffle_tables(cursor)
         auto_close_expired(cursor)
         conn.commit()
 
@@ -574,6 +784,11 @@ def getEvents(request: Request):
         for (eid, title, desc, reward, metric, brawler_name,
              started_at, ends_at, closed_at, is_active) in rows:
             participants = compute_results(cursor, eid, metric, brawler_name)
+            cursor.execute("""
+                SELECT position, tickets FROM event_ticket_rules
+                WHERE event_id = %s ORDER BY position
+            """, (eid,))
+            ticket_rewards = [{"position": p, "tickets": t} for (p, t) in cursor.fetchall()]
             result.append({
                 "id": eid,
                 "title": title,
@@ -585,7 +800,8 @@ def getEvents(request: Request):
                 "ends_at": ends_at.isoformat() if ends_at else None,
                 "closed_at": closed_at.isoformat() if closed_at else None,
                 "is_active": is_active,
-                "participants": participants
+                "participants": participants,
+                "ticket_rewards": ticket_rewards
             })
         return result
     finally:
@@ -595,6 +811,11 @@ def getEvents(request: Request):
 
 # ── EVENTS: ADMIN ENDPOINTS ──────────────────────────────────────────────────
 
+class TicketReward(BaseModel):
+    position: int
+    tickets: int
+
+
 class CreateEventBody(BaseModel):
     title: str
     description: Optional[str] = None
@@ -602,6 +823,7 @@ class CreateEventBody(BaseModel):
     metric: str = "trophies"
     brawler_name: Optional[str] = None   # required when metric == brawler_trophies
     duration_hours: float
+    ticket_rewards: Optional[List[TicketReward]] = None  # tickets de sorteo por posición final
 
 
 @app.post("/events")
@@ -619,10 +841,22 @@ def createEvent(request: Request, body: CreateEventBody, x_admin_key: Optional[s
     if body.duration_hours <= 0:
         raise HTTPException(status_code=400, detail="duration_hours debe ser mayor a 0")
 
+    clean_rewards = []
+    if body.ticket_rewards:
+        seen_positions = set()
+        for tr in body.ticket_rewards:
+            if tr.position < 1 or tr.tickets < 0:
+                raise HTTPException(status_code=400, detail="Posición y tickets de premio deben ser válidos (posición ≥ 1, tickets ≥ 0).")
+            if tr.position in seen_positions:
+                raise HTTPException(status_code=400, detail=f"Posición {tr.position} repetida en los premios de tickets.")
+            seen_positions.add(tr.position)
+            clean_rewards.append((tr.position, tr.tickets))
+
     conn = get_conn()
     cursor = conn.cursor()
     try:
         ensure_events_tables(cursor)
+        ensure_raffle_tables(cursor)
 
         # Close any currently active event before creating a new one
         cursor.execute("""
@@ -640,9 +874,18 @@ def createEvent(request: Request, body: CreateEventBody, x_admin_key: Optional[s
 
         snapshot_values(cursor, event_id, body.metric, body.brawler_name)
 
+        for position, tickets in clean_rewards:
+            cursor.execute("""
+                INSERT INTO event_ticket_rules (event_id, position, tickets)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (event_id, position) DO UPDATE SET tickets = EXCLUDED.tickets
+            """, (event_id, position, tickets))
+
         conn.commit()
         return {"ok": True, "event_id": event_id}
-    except Exception as e:
+    except HTTPException:
+        raise
+    except Exception:
         conn.rollback()
         raise HTTPException(status_code=500, detail="Error al crear el evento")
     finally:
@@ -682,6 +925,287 @@ def closeEvent(request: Request, event_id: int, x_admin_key: Optional[str] = Hea
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail="Error al cerrar el evento")
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# ── SORTEOS (RAFFLE) ─────────────────────────────────────────────────────────
+# Cada mes se sortea un Brawl Pass Plus entre todos los miembros del club. La
+# chance de ganar es proporcional a la cantidad de Tickets acumulados en el
+# mes en curso. Los tickets NO se guardan como contador que hay que resetear:
+# se calculan siempre en vivo a partir de datos que ya existen en la base
+# (player_of_day, player_stats_history, resultados de torneos cerrados),
+# filtrados por el mes actual (huso horario UY). Esto tiene una ventaja
+# grande: el reset mensual es automático y gratis, ya que en cuanto cambia
+# el mes la ventana de la consulta vuelve a empezar de cero para todos.
+#
+# Fuentes de tickets:
+#   +10  por cada vez que el jugador fue "jugador del día" durante el mes
+#   +1   por cada 100 trofeos netos ganados en el mes (no baja si perdés)
+#   +N   según la posición final en cada torneo cerrado durante el mes,
+#        donde N lo define el admin al crear el torneo (event_ticket_rules)
+#
+# El sorteo en sí (elegir un ganador al azar, ponderado por tickets) es lo
+# único que SÍ se persiste, porque debe quedar fijo para siempre una vez
+# ejecutado. Lo dispara el propio datacollector.py en cada corrida (cada 30
+# minutos) llamando a POST /raffle/draw con la clave de admin: el endpoint
+# es idempotente por mes, así que no hay riesgo de sortear dos veces.
+
+def ensure_raffle_tables(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS event_ticket_rules (
+            event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+            position INTEGER NOT NULL,
+            tickets  INTEGER NOT NULL,
+            PRIMARY KEY (event_id, position)
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS raffle_config (
+            id         INTEGER PRIMARY KEY DEFAULT 1,
+            prize      TEXT NOT NULL DEFAULT 'Brawl Pass Plus',
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT raffle_config_single_row CHECK (id = 1)
+        )
+    """)
+    cursor.execute("""
+        INSERT INTO raffle_config (id, prize) VALUES (1, 'Brawl Pass Plus')
+        ON CONFLICT (id) DO NOTHING
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS raffle_draws (
+            id                  SERIAL PRIMARY KEY,
+            cycle_month         DATE NOT NULL UNIQUE,
+            prize               TEXT NOT NULL,
+            winner_tag          TEXT,
+            winner_name         TEXT,
+            winner_tickets      INTEGER,
+            total_tickets       INTEGER NOT NULL DEFAULT 0,
+            total_participants  INTEGER NOT NULL DEFAULT 0,
+            drawn_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+
+
+def uy_month_bounds(year: int, month: int):
+    """(inicio, fin) del mes en horario UY, expresados en UTC. fin es exclusivo."""
+    start = datetime(year, month, 1, 3, 0, 0, tzinfo=timezone.utc)  # 00:00 UY = 03:00 UTC
+    if month == 12:
+        end = datetime(year + 1, 1, 1, 3, 0, 0, tzinfo=timezone.utc)
+    else:
+        end = datetime(year, month + 1, 1, 3, 0, 0, tzinfo=timezone.utc)
+    return start, end
+
+
+def compute_raffle_tickets(cursor, month_start: datetime, month_end: datetime):
+    """
+    Devuelve la lista de TODOS los jugadores del club con su desglose de
+    tickets para la ventana [month_start, month_end), ordenada de mayor a
+    menor. Cada fuente se recalcula en vivo (ver comentario de sección).
+    """
+    # 1) +10 por cada día en que el jugador fue "jugador del día" este mes
+    cursor.execute("""
+        SELECT player_tag, COUNT(*) * 10
+        FROM player_of_day
+        WHERE day >= %s AND day < %s
+        GROUP BY player_tag
+    """, (month_start.date(), month_end.date()))
+    potd_map = dict(cursor.fetchall())
+
+    # 2) +1 por cada 100 trofeos netos ganados este mes (mismo patrón que el
+    #    cálculo de "jugador del día", pero con ventana mensual en vez de diaria)
+    cursor.execute("""
+        WITH ranked AS (
+            SELECT player_tag, trophies, timestamp,
+                   ROW_NUMBER() OVER (PARTITION BY player_tag ORDER BY timestamp ASC)  AS rn_asc,
+                   ROW_NUMBER() OVER (PARTITION BY player_tag ORDER BY timestamp DESC) AS rn_desc
+            FROM player_stats_history
+            WHERE timestamp >= %s AND timestamp < %s
+        ),
+        month_first AS (SELECT player_tag, trophies FROM ranked WHERE rn_asc = 1),
+        month_last  AS (SELECT player_tag, trophies FROM ranked WHERE rn_desc = 1)
+        SELECT ml.player_tag, GREATEST(0, ml.trophies - mf.trophies) AS gained
+        FROM month_last ml
+        JOIN month_first mf USING (player_tag)
+    """, (month_start, month_end))
+    trophies_map = {tag: gained // 100 for tag, gained in cursor.fetchall()}
+
+    # 3) tickets según posición final en torneos cerrados durante el mes
+    cursor.execute("""
+        SELECT id, metric, brawler_name FROM events
+        WHERE is_active = FALSE AND closed_at >= %s AND closed_at < %s
+    """, (month_start, month_end))
+    events_map = {}
+    for (eid, metric, brawler_name) in cursor.fetchall():
+        cursor.execute("SELECT position, tickets FROM event_ticket_rules WHERE event_id = %s", (eid,))
+        rules = dict(cursor.fetchall())
+        if not rules:
+            continue
+        for r in compute_results(cursor, eid, metric, brawler_name):
+            reward = rules.get(r["rank"])
+            if reward:
+                events_map[r["tag"]] = events_map.get(r["tag"], 0) + reward
+
+    # 4) combinar con la lista completa de jugadores actuales del club
+    cursor.execute("SELECT tag, name, icon_url, club_name FROM players")
+    result = []
+    for (tag, name, icon_url, club_name) in cursor.fetchall():
+        potd = potd_map.get(tag, 0)
+        troph = trophies_map.get(tag, 0)
+        ev = events_map.get(tag, 0)
+        result.append({
+            "tag": tag,
+            "name": name,
+            "icon_url": icon_url,
+            "club_name": club_name,
+            "tickets_player_of_day": potd,
+            "tickets_trophies": troph,
+            "tickets_events": ev,
+            "tickets_total": potd + troph + ev,
+        })
+
+    result.sort(key=lambda r: (-r["tickets_total"], r["name"] or ""))
+    for i, r in enumerate(result):
+        r["rank"] = i + 1
+    return result
+
+
+@app.get("/raffle")
+@limiter.limit("20/minute")
+def getRaffle(request: Request):
+    conn = get_conn()
+    cursor = conn.cursor()
+    from datetime import timedelta
+    try:
+        ensure_raffle_tables(cursor)
+        conn.commit()
+
+        now_uy = datetime.now(timezone.utc) - timedelta(hours=3)
+        month_start, month_end = uy_month_bounds(now_uy.year, now_uy.month)
+        ranking = compute_raffle_tickets(cursor, month_start, month_end)
+
+        cursor.execute("SELECT prize, updated_at FROM raffle_config WHERE id = 1")
+        row = cursor.fetchone()
+        prize, prize_updated_at = (row[0], row[1]) if row else ("Brawl Pass Plus", None)
+
+        cursor.execute("""
+            SELECT cycle_month, prize, winner_tag, winner_name, winner_tickets,
+                   total_tickets, total_participants, drawn_at
+            FROM raffle_draws ORDER BY cycle_month DESC LIMIT 6
+        """)
+        last_draws = [{
+            "cycle_month": cm.isoformat(),
+            "prize": pz,
+            "winner_tag": wt,
+            "winner_name": wn,
+            "winner_tickets": wtk,
+            "total_tickets": tt,
+            "total_participants": tp,
+            "drawn_at": da.isoformat() if da else None,
+        } for (cm, pz, wt, wn, wtk, tt, tp, da) in cursor.fetchall()]
+
+        return {
+            "cycle_month": month_start.date().isoformat(),
+            "draw_at": month_end.isoformat(),
+            "prize": prize,
+            "ranking": ranking,
+            "last_draws": last_draws,
+        }
+    finally:
+        cursor.close()
+        conn.close()
+
+
+class RaffleConfigBody(BaseModel):
+    prize: str
+
+
+@app.patch("/raffle/config")
+@limiter.limit("5/minute")
+def updateRaffleConfig(request: Request, body: RaffleConfigBody, x_admin_key: Optional[str] = Header(None)):
+    check_admin(x_admin_key)
+    prize = (body.prize or "").strip()
+    if not prize:
+        raise HTTPException(status_code=400, detail="El premio no puede estar vacío.")
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        ensure_raffle_tables(cursor)
+        cursor.execute("UPDATE raffle_config SET prize = %s, updated_at = NOW() WHERE id = 1", (prize,))
+        conn.commit()
+        return {"ok": True}
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.post("/raffle/draw")
+@limiter.limit("5/minute")
+def drawRaffle(request: Request, x_admin_key: Optional[str] = Header(None)):
+    """
+    Sortea el ganador del ÚLTIMO mes ya finalizado (el anterior al actual),
+    si todavía no fue sorteado. Es seguro llamarlo repetidamente: si ese mes
+    ya tiene un sorteo registrado, no hace nada. Lo llama el datacollector
+    en cada corrida automática; también sirve como botón de emergencia para
+    el admin si por algún motivo el sorteo automático no se disparó.
+    """
+    check_admin(x_admin_key)
+    from datetime import date as date_cls, timedelta
+
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        ensure_raffle_tables(cursor)
+
+        now_uy = datetime.now(timezone.utc) - timedelta(hours=3)
+        if now_uy.month == 1:
+            prev_year, prev_month = now_uy.year - 1, 12
+        else:
+            prev_year, prev_month = now_uy.year, now_uy.month - 1
+        cycle_date = date_cls(prev_year, prev_month, 1)
+
+        cursor.execute("SELECT 1 FROM raffle_draws WHERE cycle_month = %s", (cycle_date,))
+        if cursor.fetchone():
+            return {"ok": True, "skipped": True, "reason": "Ese mes ya fue sorteado."}
+
+        month_start, month_end = uy_month_bounds(prev_year, prev_month)
+        ranking = compute_raffle_tickets(cursor, month_start, month_end)
+        eligible = [r for r in ranking if r["tickets_total"] > 0]
+
+        cursor.execute("SELECT prize FROM raffle_config WHERE id = 1")
+        row = cursor.fetchone()
+        prize = row[0] if row else "Brawl Pass Plus"
+
+        winner = None
+        if eligible:
+            rng = random.SystemRandom()
+            weights = [r["tickets_total"] for r in eligible]
+            winner = rng.choices(eligible, weights=weights, k=1)[0]
+
+        cursor.execute("""
+            INSERT INTO raffle_draws
+                (cycle_month, prize, winner_tag, winner_name, winner_tickets,
+                 total_tickets, total_participants)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (cycle_month) DO NOTHING
+            RETURNING id
+        """, (
+            cycle_date, prize,
+            winner["tag"] if winner else None,
+            winner["name"] if winner else None,
+            winner["tickets_total"] if winner else None,
+            sum(r["tickets_total"] for r in eligible),
+            len(eligible),
+        ))
+        inserted = cursor.fetchone()
+        conn.commit()
+
+        if not inserted:
+            # Otra request ganó la carrera y sorteó este mes justo antes que nosotros.
+            return {"ok": True, "skipped": True, "reason": "Ese mes ya fue sorteado."}
+
+        return {"ok": True, "skipped": False, "cycle_month": cycle_date.isoformat(), "winner": winner}
     finally:
         cursor.close()
         conn.close()
