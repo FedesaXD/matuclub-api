@@ -1211,6 +1211,64 @@ def drawRaffle(request: Request, x_admin_key: Optional[str] = Header(None)):
         conn.close()
 
 
+# ── ANÁLISIS: RANKING DE CLUBES (Uruguay / Mundo) ────────────────────────────
+# Guarda una foto del ranking OFICIAL de clubes de Supercell (top 200 de
+# Uruguay y top 200 del Mundo). Se pisa por completo en cada corrida del
+# datacollector (no nos interesa el historial, solo la posición actual).
+def ensure_club_rankings_table(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS club_rankings (
+            region       TEXT NOT NULL,
+            rank         INTEGER NOT NULL,
+            club_tag     TEXT NOT NULL,
+            club_name    TEXT NOT NULL,
+            trophies     INTEGER NOT NULL,
+            member_count INTEGER,
+            fetched_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (region, club_tag)
+        )
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_club_rankings_region_rank
+        ON club_rankings(region, rank)
+    """)
+
+
+@app.get("/club-rankings")
+@limiter.limit("20/minute")
+def getClubRankings(request: Request):
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        ensure_club_rankings_table(cursor)
+        conn.commit()
+
+        result = {}
+        for region in ("UY", "global"):
+            cursor.execute("""
+                SELECT rank, club_tag, club_name, trophies, member_count
+                FROM club_rankings
+                WHERE region = %s
+                ORDER BY rank ASC
+            """, (region,))
+            result[region] = [
+                {"rank": r, "tag": tag, "name": name, "trophies": tr, "member_count": mc}
+                for (r, tag, name, tr, mc) in cursor.fetchall()
+            ]
+
+        cursor.execute("SELECT MAX(fetched_at) FROM club_rankings")
+        row = cursor.fetchone()
+
+        return {
+            "uy": result["UY"],
+            "global": result["global"],
+            "last_updated": row[0].isoformat() if row and row[0] else None,
+        }
+    finally:
+        cursor.close()
+        conn.close()
+
+
 # ── STATUS ────────────────────────────────────────────────────────────────────
 
 @app.get("/status")
@@ -1305,7 +1363,9 @@ def getPlayerOfDayWinners(request: Request):
 def getPlayerOfDay(request: Request):
     """
     Devuelve:
-      - today_ranking: top 20 jugadores del día actual con sus deltas (calculado en vivo)
+      - today_ranking: TODOS los jugadores con actividad hoy y sus deltas
+        (calculado en vivo, sin límite — así cualquier jugador puede ver
+        sus puntos reales aunque no esté entre los primeros puestos)
       - history: ganadores de los últimos 7 días (sin incluir hoy)
       - last_updated: timestamp del último cómputo del collector
     """
@@ -1361,7 +1421,6 @@ def getPlayerOfDay(request: Request):
                 GREATEST(0, COALESCE(dl.winssolo,       pv.winssolo)       - COALESCE(df.winssolo,       pv.winssolo,       0)) * 4 +
                 GREATEST(0, COALESCE(dl.total_prestige, pv.total_prestige) - COALESCE(df.total_prestige, pv.total_prestige, 0)) * 80
             ) DESC
-            LIMIT 20
         """, (day_start, day_end, day_start))
 
         today_rows = cursor.fetchall()
