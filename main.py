@@ -168,6 +168,9 @@ def ensure_users_table(cursor):
             locked_until     TIMESTAMPTZ
         )
     """)
+    cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS banned BOOLEAN NOT NULL DEFAULT FALSE")
+    cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS banned_reason TEXT")
+    cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS banned_at TIMESTAMPTZ")
 
 
 class RegisterBody(BaseModel):
@@ -245,13 +248,19 @@ def login(request: Request, body: LoginBody):
     try:
         ensure_users_table(cursor)
         cursor.execute("""
-            SELECT id, username, player_tag, password_hash, failed_attempts, locked_until
+            SELECT id, username, player_tag, password_hash, failed_attempts, locked_until, banned, banned_reason
             FROM users WHERE username_lower = %s
         """, (username,))
         row = cursor.fetchone()
         if not row:
             raise generic_error
-        user_id, real_username, tag, pw_hash, failed_attempts, locked_until = row
+        user_id, real_username, tag, pw_hash, failed_attempts, locked_until, banned, banned_reason = row
+
+        if banned:
+            raise HTTPException(
+                status_code=403,
+                detail="Esta cuenta fue suspendida" + (f": {banned_reason}" if banned_reason else ".")
+            )
 
         if locked_until and locked_until > datetime.now(timezone.utc):
             raise HTTPException(
@@ -293,6 +302,119 @@ def login(request: Request, body: LoginBody):
 @limiter.limit("30/minute")
 def me(request: Request, user=Depends(get_current_user)):
     return {"username": user["username"], "tag": user["tag"]}
+
+
+# ── ADMIN: GESTIÓN DE CUENTAS ────────────────────────────────────────────────
+class BanBody(BaseModel):
+    reason: Optional[str] = None
+
+
+@app.get("/admin/users")
+@limiter.limit("20/minute")
+def adminListUsers(request: Request, x_admin_key: Optional[str] = Header(None)):
+    check_admin(x_admin_key)
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        ensure_users_table(cursor)
+        cursor.execute("""
+            SELECT id, username, player_tag, created_at, last_login_at,
+                   banned, banned_reason, banned_at, failed_attempts, locked_until
+            FROM users
+            ORDER BY created_at DESC
+        """)
+        rows = cursor.fetchall()
+        return [{
+            "id": uid,
+            "username": username,
+            "tag": tag,
+            "created_at": created_at.isoformat() if created_at else None,
+            "last_login_at": last_login.isoformat() if last_login else None,
+            "banned": banned,
+            "banned_reason": banned_reason,
+            "banned_at": banned_at.isoformat() if banned_at else None,
+            "failed_attempts": failed_attempts,
+            "locked_until": locked_until.isoformat() if locked_until else None,
+        } for (uid, username, tag, created_at, last_login, banned, banned_reason,
+               banned_at, failed_attempts, locked_until) in rows]
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.patch("/admin/users/{user_id}/ban")
+@limiter.limit("15/minute")
+def adminBanUser(request: Request, user_id: int, body: BanBody, x_admin_key: Optional[str] = Header(None)):
+    check_admin(x_admin_key)
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        ensure_users_table(cursor)
+        cursor.execute("""
+            UPDATE users SET banned = TRUE, banned_reason = %s, banned_at = NOW()
+            WHERE id = %s RETURNING id
+        """, ((body.reason or '').strip() or None, user_id))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Cuenta no encontrada")
+        conn.commit()
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail="No se pudo suspender la cuenta")
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.patch("/admin/users/{user_id}/unban")
+@limiter.limit("15/minute")
+def adminUnbanUser(request: Request, user_id: int, x_admin_key: Optional[str] = Header(None)):
+    check_admin(x_admin_key)
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        ensure_users_table(cursor)
+        cursor.execute("""
+            UPDATE users SET banned = FALSE, banned_reason = NULL, banned_at = NULL
+            WHERE id = %s RETURNING id
+        """, (user_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Cuenta no encontrada")
+        conn.commit()
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail="No se pudo reactivar la cuenta")
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.delete("/admin/users/{user_id}")
+@limiter.limit("10/minute")
+def adminDeleteUser(request: Request, user_id: int, x_admin_key: Optional[str] = Header(None)):
+    check_admin(x_admin_key)
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        ensure_users_table(cursor)
+        cursor.execute("DELETE FROM users WHERE id = %s RETURNING id", (user_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Cuenta no encontrada")
+        conn.commit()
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail="No se pudo eliminar la cuenta")
+    finally:
+        cursor.close()
+        conn.close()
 
 
 # ── EXISTING ENDPOINTS (unchanged) ───────────────────────────────────────────
@@ -930,7 +1052,36 @@ def closeEvent(request: Request, event_id: int, x_admin_key: Optional[str] = Hea
         conn.close()
 
 
-# ── SORTEOS (RAFFLE) ─────────────────────────────────────────────────────────
+@app.delete("/events/{event_id}")
+@limiter.limit("5/minute")
+def deleteEvent(request: Request, event_id: int, x_admin_key: Optional[str] = Header(None)):
+    check_admin(x_admin_key)
+
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        ensure_events_tables(cursor)
+        ensure_raffle_tables(cursor)
+
+        cursor.execute("SELECT 1 FROM events WHERE id = %s", (event_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Evento no encontrado")
+
+        # event_snapshots y event_ticket_rules se borran solos vía ON DELETE CASCADE
+        cursor.execute("DELETE FROM events WHERE id = %s", (event_id,))
+        conn.commit()
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail="Error al eliminar el evento")
+    finally:
+        cursor.close()
+        conn.close()
+
+
+
 # Cada mes se sortea un Brawl Pass Plus entre todos los miembros del club. La
 # chance de ganar es proporcional a la cantidad de Tickets acumulados en el
 # mes en curso. Los tickets NO se guardan como contador que hay que resetear:
@@ -986,6 +1137,40 @@ def ensure_raffle_tables(cursor):
             drawn_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """)
+    # Migraciones idempotentes (columnas agregadas después de la primera versión
+    # de esta tabla) — permiten resortear un mes sin perder de vista a quién ya
+    # se le dio la oportunidad, para nunca repetir ganador dentro del mismo mes.
+    cursor.execute("ALTER TABLE raffle_draws ADD COLUMN IF NOT EXISTS excluded_tags TEXT[] NOT NULL DEFAULT '{}'")
+    cursor.execute("ALTER TABLE raffle_draws ADD COLUMN IF NOT EXISTS redraw_count INTEGER NOT NULL DEFAULT 0")
+
+    # Tickets diarios reclamados a mano desde la web (2 por día, ver
+    # /raffle/claim-daily). El UNIQUE (player_tag, claim_date) es la
+    # verdadera barrera anti-doble-reclamo: es una restricción de base de
+    # datos, no una validación de aplicación, así que ni una condición de
+    # carrera ni un reintento manual pueden burlarla.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS daily_ticket_claims (
+            id          SERIAL PRIMARY KEY,
+            player_tag  TEXT NOT NULL,
+            claim_date  DATE NOT NULL,
+            tickets     INTEGER NOT NULL DEFAULT 2,
+            claimed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (player_tag, claim_date)
+        )
+    """)
+
+
+def uy_today():
+    """Fecha de hoy en horario de Uruguay (UTC-3)."""
+    from datetime import timedelta
+    return (datetime.now(timezone.utc) - timedelta(hours=3)).date()
+
+
+def uy_next_midnight_utc():
+    """Próxima medianoche en horario UY (00:00 UY), expresada en UTC."""
+    from datetime import timedelta
+    tomorrow_uy = uy_today() + timedelta(days=1)
+    return datetime(tomorrow_uy.year, tomorrow_uy.month, tomorrow_uy.day, 3, 0, 0, tzinfo=timezone.utc)
 
 
 def uy_month_bounds(year: int, month: int):
@@ -1047,13 +1232,30 @@ def compute_raffle_tickets(cursor, month_start: datetime, month_end: datetime):
             if reward:
                 events_map[r["tag"]] = events_map.get(r["tag"], 0) + reward
 
-    # 4) combinar con la lista completa de jugadores actuales del club
+    # 4) Tickets diarios reclamados a mano en la web (2 por día reclamado este mes)
+    cursor.execute("""
+        SELECT player_tag, SUM(tickets)
+        FROM daily_ticket_claims
+        WHERE claim_date >= %s AND claim_date < %s
+        GROUP BY player_tag
+    """, (month_start.date(), month_end.date()))
+    daily_map = dict(cursor.fetchall())
+
+    # 5) combinar con la lista completa de jugadores actuales del club.
+    # Las cuentas baneadas quedan totalmente afuera del sorteo (ranking Y
+    # elegibilidad) mientras dure el baneo.
+    cursor.execute("SELECT player_tag FROM users WHERE banned = TRUE")
+    banned_tags = {row[0] for row in cursor.fetchall()}
+
     cursor.execute("SELECT tag, name, icon_url, club_name FROM players")
     result = []
     for (tag, name, icon_url, club_name) in cursor.fetchall():
+        if tag in banned_tags:
+            continue
         potd = potd_map.get(tag, 0)
         troph = trophies_map.get(tag, 0)
         ev = events_map.get(tag, 0)
+        daily = daily_map.get(tag, 0)
         result.append({
             "tag": tag,
             "name": name,
@@ -1062,7 +1264,8 @@ def compute_raffle_tickets(cursor, month_start: datetime, month_end: datetime):
             "tickets_player_of_day": potd,
             "tickets_trophies": troph,
             "tickets_events": ev,
-            "tickets_total": potd + troph + ev,
+            "tickets_daily_claim": daily,
+            "tickets_total": potd + troph + ev + daily,
         })
 
     result.sort(key=lambda r: (-r["tickets_total"], r["name"] or ""))
@@ -1117,6 +1320,92 @@ def getRaffle(request: Request):
         conn.close()
 
 
+# ── TICKETS DIARIOS ───────────────────────────────────────────────────────
+# 2 Tickets por día, reclamables una vez por día calendario UY, exclusivos
+# para cuentas registradas y vinculadas a un jugador actual del club. La
+# barrera real contra el doble reclamo es la restricción UNIQUE de la base
+# de datos (player_tag, claim_date) en daily_ticket_claims — no una
+# comprobación de aplicación — así que ni una doble request simultánea, ni
+# un reintento manual, ni manipular el estado del navegador puede burlarla:
+# Postgres rechaza el segundo INSERT del mismo día pase lo que pase.
+DAILY_CLAIM_TICKETS = 2
+
+
+@app.get("/raffle/claim-daily")
+@limiter.limit("30/minute")
+def getClaimDailyStatus(request: Request, user=Depends(get_current_user)):
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        ensure_raffle_tables(cursor)
+        conn.commit()
+
+        today = uy_today()
+        cursor.execute("""
+            SELECT 1 FROM daily_ticket_claims WHERE player_tag = %s AND claim_date = %s
+        """, (user["tag"], today))
+        claimed = cursor.fetchone() is not None
+
+        return {
+            "claimed_today": claimed,
+            "tickets": DAILY_CLAIM_TICKETS,
+            "next_claim_at": uy_next_midnight_utc().isoformat(),
+        }
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.post("/raffle/claim-daily")
+@limiter.limit("10/minute")
+def claimDaily(request: Request, user=Depends(get_current_user)):
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        ensure_raffle_tables(cursor)
+        ensure_users_table(cursor)
+
+        # El estado de baneo y de pertenencia al club se verifica siempre
+        # fresco contra la base — nunca confiamos en el contenido del JWT
+        # para esto, porque el token pudo emitirse antes de un baneo.
+        cursor.execute("SELECT banned FROM users WHERE player_tag = %s", (user["tag"],))
+        row = cursor.fetchone()
+        if row and row[0]:
+            raise HTTPException(status_code=403, detail="Tu cuenta está suspendida.")
+
+        cursor.execute("SELECT 1 FROM players WHERE tag = %s", (user["tag"],))
+        if not cursor.fetchone():
+            raise HTTPException(
+                status_code=403,
+                detail="Tu tag no corresponde a un jugador activo del club en este momento."
+            )
+
+        today = uy_today()
+        try:
+            cursor.execute("""
+                INSERT INTO daily_ticket_claims (player_tag, claim_date, tickets)
+                VALUES (%s, %s, %s)
+            """, (user["tag"], today, DAILY_CLAIM_TICKETS))
+            conn.commit()
+        except psycopg2.errors.UniqueViolation:
+            conn.rollback()
+            raise HTTPException(status_code=409, detail="Ya reclamaste tus Tickets de hoy.")
+
+        return {
+            "ok": True,
+            "tickets": DAILY_CLAIM_TICKETS,
+            "next_claim_at": uy_next_midnight_utc().isoformat(),
+        }
+    except HTTPException:
+        raise
+    except Exception:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail="No se pudo reclamar el Ticket diario.")
+    finally:
+        cursor.close()
+        conn.close()
+
+
 class RaffleConfigBody(BaseModel):
     prize: str
 
@@ -1138,6 +1427,16 @@ def updateRaffleConfig(request: Request, body: RaffleConfigBody, x_admin_key: Op
     finally:
         cursor.close()
         conn.close()
+
+
+def pick_weighted_winner(eligible):
+    """Elige un ganador al azar, ponderado por tickets. eligible ya debe venir
+    filtrado (tickets_total > 0, excluidos los que correspondan)."""
+    if not eligible:
+        return None
+    rng = random.SystemRandom()
+    weights = [r["tickets_total"] for r in eligible]
+    return rng.choices(eligible, weights=weights, k=1)[0]
 
 
 @app.post("/raffle/draw")
@@ -1177,11 +1476,7 @@ def drawRaffle(request: Request, x_admin_key: Optional[str] = Header(None)):
         row = cursor.fetchone()
         prize = row[0] if row else "Brawl Pass Plus"
 
-        winner = None
-        if eligible:
-            rng = random.SystemRandom()
-            weights = [r["tickets_total"] for r in eligible]
-            winner = rng.choices(eligible, weights=weights, k=1)[0]
+        winner = pick_weighted_winner(eligible)
 
         cursor.execute("""
             INSERT INTO raffle_draws
@@ -1206,6 +1501,88 @@ def drawRaffle(request: Request, x_admin_key: Optional[str] = Header(None)):
             return {"ok": True, "skipped": True, "reason": "Ese mes ya fue sorteado."}
 
         return {"ok": True, "skipped": False, "cycle_month": cycle_date.isoformat(), "winner": winner}
+    finally:
+        cursor.close()
+        conn.close()
+
+
+class RedrawBody(BaseModel):
+    cycle_month: str  # "YYYY-MM-01"
+
+
+@app.post("/admin/raffle/redraw")
+@limiter.limit("10/minute")
+def redrawRaffle(request: Request, body: RedrawBody, x_admin_key: Optional[str] = Header(None)):
+    """
+    Vuelve a sortear un mes YA sorteado, excluyendo a todos los ganadores
+    anteriores de ese mes (si esta es la segunda vez que se re-sortea porque
+    el primer re-sorteo tampoco reclamó el premio, ese también queda afuera).
+    Útil cuando el ganador no reclama el Brawl Pass Plus en un tiempo
+    razonable. Usa los mismos tickets ya calculados para ese mes — el pool
+    de participantes no cambia, solo se vuelve a tirar el dado excluyendo a
+    quienes ya tuvieron su oportunidad.
+    """
+    check_admin(x_admin_key)
+    from datetime import date as date_cls
+
+    try:
+        cycle_date = date_cls.fromisoformat(body.cycle_month)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Formato de mes inválido, usá YYYY-MM-01")
+
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        ensure_raffle_tables(cursor)
+
+        cursor.execute("""
+            SELECT winner_tag, excluded_tags, prize, redraw_count
+            FROM raffle_draws WHERE cycle_month = %s
+        """, (cycle_date,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Ese mes no tiene un sorteo registrado todavía.")
+        prev_winner, excluded_tags, prize, redraw_count = row
+
+        new_excluded = set(excluded_tags or [])
+        if prev_winner:
+            new_excluded.add(prev_winner)
+
+        month_start, month_end = uy_month_bounds(cycle_date.year, cycle_date.month)
+        ranking = compute_raffle_tickets(cursor, month_start, month_end)
+        eligible = [r for r in ranking if r["tickets_total"] > 0 and r["tag"] not in new_excluded]
+
+        winner = pick_weighted_winner(eligible)
+
+        cursor.execute("""
+            UPDATE raffle_draws SET
+                winner_tag = %s, winner_name = %s, winner_tickets = %s,
+                total_tickets = %s, total_participants = %s,
+                excluded_tags = %s, redraw_count = redraw_count + 1, drawn_at = NOW()
+            WHERE cycle_month = %s
+        """, (
+            winner["tag"] if winner else None,
+            winner["name"] if winner else None,
+            winner["tickets_total"] if winner else None,
+            sum(r["tickets_total"] for r in eligible),
+            len(eligible),
+            list(new_excluded),
+            cycle_date,
+        ))
+        conn.commit()
+
+        return {
+            "ok": True,
+            "cycle_month": cycle_date.isoformat(),
+            "winner": winner,
+            "excluded_tags": list(new_excluded),
+            "redraw_count": redraw_count + 1,
+        }
+    except HTTPException:
+        raise
+    except Exception:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail="No se pudo re-sortear ese mes.")
     finally:
         cursor.close()
         conn.close()
