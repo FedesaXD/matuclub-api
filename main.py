@@ -1784,20 +1784,26 @@ def getPlayerOfDay(request: Request):
             SELECT
                 dl.player_tag,
                 p.name, p.icon_url, p.club_name,
-                GREATEST(0, COALESCE(dl.trophies,       pv.trophies)       - COALESCE(df.trophies,       pv.trophies,       0)) AS dt,
-                GREATEST(0, COALESCE(dl.wins3v3,        pv.wins3v3)        - COALESCE(df.wins3v3,        pv.wins3v3,        0)) AS dw3,
-                GREATEST(0, COALESCE(dl.winssolo,       pv.winssolo)       - COALESCE(df.winssolo,       pv.winssolo,       0)) AS dws,
-                GREATEST(0, COALESCE(dl.total_prestige, pv.total_prestige) - COALESCE(df.total_prestige, pv.total_prestige, 0)) AS dp
+                -- BASE del día = último valor ANTES de las 00:00 UY (pv), no
+                -- el primer cambio registrado DENTRO del día (df). El
+                -- historial solo guarda una fila cuando el valor cambia, así
+                -- que "df" puede ser la única fila de hoy y coincidir con
+                -- "dl" -> delta 0 aunque el jugador sí progresó. pv siempre
+                -- representa el valor real a las 00:00 UY.
+                GREATEST(0, COALESCE(dl.trophies,       pv.trophies)       - COALESCE(pv.trophies,       df.trophies,       0)) AS dt,
+                GREATEST(0, COALESCE(dl.wins3v3,        pv.wins3v3)        - COALESCE(pv.wins3v3,        df.wins3v3,        0)) AS dw3,
+                GREATEST(0, COALESCE(dl.winssolo,       pv.winssolo)       - COALESCE(pv.winssolo,       df.winssolo,       0)) AS dws,
+                GREATEST(0, COALESCE(dl.total_prestige, pv.total_prestige) - COALESCE(pv.total_prestige, df.total_prestige, 0)) AS dp
             FROM day_last dl
             LEFT JOIN day_first df USING (player_tag)
             LEFT JOIN prev_last  pv USING (player_tag)
             JOIN players p ON p.tag = dl.player_tag
             ORDER BY (
-                GREATEST(0, COALESCE(dl.trophies,       pv.trophies)       - COALESCE(df.trophies,       pv.trophies,       0)) * 1 +
-                GREATEST(0, COALESCE(dl.wins3v3,        pv.wins3v3)        - COALESCE(df.wins3v3,        pv.wins3v3,        0)) * 4 +
-                GREATEST(0, COALESCE(dl.winssolo,       pv.winssolo)       - COALESCE(df.winssolo,       pv.winssolo,       0)) * 4 +
-                GREATEST(0, COALESCE(dl.total_prestige, pv.total_prestige) - COALESCE(df.total_prestige, pv.total_prestige, 0)) * 80
-            ) DESC
+                GREATEST(0, COALESCE(dl.trophies,       pv.trophies)       - COALESCE(pv.trophies,       df.trophies,       0)) * 1 +
+                GREATEST(0, COALESCE(dl.wins3v3,        pv.wins3v3)        - COALESCE(pv.wins3v3,        df.wins3v3,        0)) * 4 +
+                GREATEST(0, COALESCE(dl.winssolo,       pv.winssolo)       - COALESCE(pv.winssolo,       df.winssolo,       0)) * 4 +
+                GREATEST(0, COALESCE(dl.total_prestige, pv.total_prestige) - COALESCE(pv.total_prestige, df.total_prestige, 0)) * 80
+            ) DESC, dl.player_tag ASC
         """, (day_start, day_end, day_start))
 
         today_rows = cursor.fetchall()
@@ -1916,14 +1922,20 @@ def _compute_and_save_player_of_day(cursor, day):
         )
         SELECT
             dl.player_tag,
-            -- Si hay snapshots del día usamos first→last, sino comparamos con prev
-            COALESCE(dl.trophies, pf.trophies)    - COALESCE(df.trophies, pf.trophies, 0)    AS dt,
-            COALESCE(dl.wins3v3, pf.wins3v3)      - COALESCE(df.wins3v3,  pf.wins3v3,  0)    AS dw3,
-            COALESCE(dl.winsSolo, pf.winsSolo)    - COALESCE(df.winsSolo, pf.winsSolo, 0)    AS dws,
-            COALESCE(dl.total_prestige, pf.total_prestige) - COALESCE(df.total_prestige, pf.total_prestige, 0) AS dp
+            -- BASE del día = último valor ANTES de las 00:00 UY (pf), no el
+            -- primer cambio registrado DENTRO del día (df). El historial solo
+            -- guarda una fila cuando el valor cambia, así que "df" puede ser
+            -- la única fila de hoy y coincidir con "dl" -> delta 0 aunque el
+            -- jugador sí progresó. pf siempre representa el valor real a las
+            -- 00:00 UY, se haya registrado una fila hoy o no.
+            COALESCE(dl.trophies, pf.trophies)    - COALESCE(pf.trophies, df.trophies, 0)    AS dt,
+            COALESCE(dl.wins3v3, pf.wins3v3)      - COALESCE(pf.wins3v3,  df.wins3v3,  0)    AS dw3,
+            COALESCE(dl.winsSolo, pf.winsSolo)    - COALESCE(pf.winsSolo, df.winsSolo, 0)    AS dws,
+            COALESCE(dl.total_prestige, pf.total_prestige) - COALESCE(pf.total_prestige, df.total_prestige, 0) AS dp
         FROM day_last dl
         LEFT JOIN day_first df USING (player_tag)
         LEFT JOIN prev_last  pf USING (player_tag)
+        ORDER BY dl.player_tag
     """, (day_start, day_end, day_start))
 
     deltas = cursor.fetchall()
