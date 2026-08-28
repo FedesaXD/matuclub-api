@@ -53,9 +53,26 @@ app.add_middleware(SecurityHeadersMiddleware)
 
 # ── Rate limiter: leer IP real detrás del proxy de Render ────────────────────
 def get_real_ip(request: Request) -> str:
+    """
+    IP real del cliente detrás del proxy de Render.
+
+    El PRIMER valor de X-Forwarded-For lo pone el cliente original y es
+    100% falsificable: cualquiera puede mandar el header que quiera en su
+    request. Confiar en ese primer valor (como se hacía antes) permite
+    evadir el rate limiting y el bloqueo por intentos fallidos mandando un
+    X-Forwarded-For distinto en cada request.
+
+    El ÚLTIMO valor de la cadena, en cambio, es el que agrega el proxy de
+    Render al reenviar la request a esta app — el cliente no lo puede
+    pisar. Como delante de esta app hay un único salto de proxy confiable
+    (Render), ese último valor es la IP real. Si en el futuro se agrega
+    otro proxy/CDN delante de Render, este criterio habría que revisarlo.
+    """
     forwarded_for = request.headers.get("X-Forwarded-For")
     if forwarded_for:
-        return forwarded_for.split(",")[0].strip()
+        parts = [p.strip() for p in forwarded_for.split(",") if p.strip()]
+        if parts:
+            return parts[-1]
     return request.client.host if request.client else "unknown"
 
 limiter = Limiter(key_func=get_real_ip)
@@ -134,7 +151,18 @@ def create_access_token(user_id: int, username: str, tag: str) -> str:
 
 
 def get_current_user(authorization: Optional[str] = Header(None)):
-    """Dependencia de FastAPI: valida el JWT del header Authorization: Bearer <token>."""
+    """
+    Dependencia de FastAPI: valida el JWT del header Authorization: Bearer <token>.
+
+    El JWT no tiene revocación propia y dura hasta 30 días (JWT_EXPIRE_DAYS):
+    si solo confiáramos en su firma/expiración, una cuenta baneada (o borrada)
+    DESPUÉS de emitido el token seguiría pasando esta validación sin problema
+    hasta que el token expire solo, y cualquier endpoint que dependa de esta
+    función sin re-chequear el baneo a mano quedaría abierto para esa cuenta.
+    Por eso acá se vuelve a consultar el estado real contra la base en cada
+    request — el baneo (o el borrado de la cuenta) tiene efecto inmediato en
+    TODOS los endpoints protegidos, no solo en los que lo verifican aparte.
+    """
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="No autenticado")
     token = authorization.split(" ", 1)[1].strip()
@@ -144,6 +172,31 @@ def get_current_user(authorization: Optional[str] = Header(None)):
         raise HTTPException(status_code=401, detail="Tu sesión expiró, iniciá sesión de nuevo")
     except pyjwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Sesión inválida")
+
+    try:
+        user_id = int(payload.get("sub"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Sesión inválida")
+
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        ensure_users_table(cursor)
+        cursor.execute("SELECT banned, banned_reason FROM users WHERE id = %s", (user_id,))
+        row = cursor.fetchone()
+        if row is None:
+            # La cuenta ya no existe (borrada por un admin) — el token quedó huérfano.
+            raise HTTPException(status_code=401, detail="Sesión inválida")
+        banned, banned_reason = row
+        if banned:
+            detail = "Esta cuenta fue suspendida."
+            if banned_reason:
+                detail = f"Esta cuenta fue suspendida: {banned_reason}"
+            raise HTTPException(status_code=403, detail=detail)
+    finally:
+        cursor.close()
+        conn.close()
+
     return payload
 
 
@@ -312,7 +365,7 @@ class BanBody(BaseModel):
 @app.get("/admin/users")
 @limiter.limit("20/minute")
 def adminListUsers(request: Request, x_admin_key: Optional[str] = Header(None)):
-    check_admin(x_admin_key)
+    check_admin(request, x_admin_key)
     conn = get_conn()
     cursor = conn.cursor()
     try:
@@ -345,7 +398,7 @@ def adminListUsers(request: Request, x_admin_key: Optional[str] = Header(None)):
 @app.patch("/admin/users/{user_id}/ban")
 @limiter.limit("15/minute")
 def adminBanUser(request: Request, user_id: int, body: BanBody, x_admin_key: Optional[str] = Header(None)):
-    check_admin(x_admin_key)
+    check_admin(request, x_admin_key)
     conn = get_conn()
     cursor = conn.cursor()
     try:
@@ -371,7 +424,7 @@ def adminBanUser(request: Request, user_id: int, body: BanBody, x_admin_key: Opt
 @app.patch("/admin/users/{user_id}/unban")
 @limiter.limit("15/minute")
 def adminUnbanUser(request: Request, user_id: int, x_admin_key: Optional[str] = Header(None)):
-    check_admin(x_admin_key)
+    check_admin(request, x_admin_key)
     conn = get_conn()
     cursor = conn.cursor()
     try:
@@ -397,7 +450,7 @@ def adminUnbanUser(request: Request, user_id: int, x_admin_key: Optional[str] = 
 @app.delete("/admin/users/{user_id}")
 @limiter.limit("10/minute")
 def adminDeleteUser(request: Request, user_id: int, x_admin_key: Optional[str] = Header(None)):
-    check_admin(x_admin_key)
+    check_admin(request, x_admin_key)
     conn = get_conn()
     cursor = conn.cursor()
     try:
@@ -752,10 +805,89 @@ def ensure_events_tables(cursor):
     """)
 
 
-def check_admin(x_admin_key: Optional[str]):
+ADMIN_MAX_ATTEMPTS = 5
+ADMIN_LOCKOUT_MINUTES = 15
+
+
+def ensure_admin_auth_table(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS admin_auth_attempts (
+            ip              TEXT PRIMARY KEY,
+            failed_attempts INTEGER NOT NULL DEFAULT 0,
+            locked_until    TIMESTAMPTZ
+        )
+    """)
+
+
+def check_admin(request: Request, x_admin_key: Optional[str]):
+    """
+    Valida la clave de administrador.
+
+    Dos cosas que antes fallaban:
+    1) La comparación se hacía con `!=`, que en Python no es de tiempo
+       constante — en teoría filtra por timing cuánto del prefijo de la
+       clave ingresada coincide con la real. Ahora se usa
+       secrets.compare_digest, pensado justo para esto.
+    2) No había ningún límite de intentos específico para la clave de
+       admin. El propio frontend usa un endpoint cualquiera protegido por
+       esta función como "oráculo" (403 = clave mal, cualquier otra cosa =
+       clave bien) para validarla en el panel de admin, y antes de este
+       fix el rate limiting general se podía evadir falsificando
+       X-Forwarded-For (ver get_real_ip) — la combinación permitía probar
+       la clave a fuerza bruta sin límite real. Ahora, además de la IP
+       real (ya no falsificable), se lleva un conteo de intentos fallidos
+       por IP y se bloquea temporalmente tras varios seguidos, igual que
+       el lockout de /auth/login.
+    """
     admin_key = os.getenv("ADMIN_KEY", "")
-    if not admin_key or x_admin_key != admin_key:
-        raise HTTPException(status_code=403, detail="No autorizado")
+    ip = get_real_ip(request)
+
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        ensure_admin_auth_table(cursor)
+        cursor.execute(
+            "SELECT failed_attempts, locked_until FROM admin_auth_attempts WHERE ip = %s",
+            (ip,)
+        )
+        row = cursor.fetchone()
+        failed_attempts, locked_until = row if row else (0, None)
+
+        if locked_until and locked_until > datetime.now(timezone.utc):
+            raise HTTPException(
+                status_code=429,
+                detail="Demasiados intentos fallidos. Probá de nuevo más tarde."
+            )
+
+        is_valid = bool(admin_key) and secrets.compare_digest(x_admin_key or "", admin_key)
+
+        if not is_valid:
+            from datetime import timedelta
+            failed_attempts += 1
+            reached_limit = failed_attempts >= ADMIN_MAX_ATTEMPTS
+            new_lock = (
+                datetime.now(timezone.utc) + timedelta(minutes=ADMIN_LOCKOUT_MINUTES)
+                if reached_limit else None
+            )
+            cursor.execute("""
+                INSERT INTO admin_auth_attempts (ip, failed_attempts, locked_until)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (ip) DO UPDATE SET
+                    failed_attempts = EXCLUDED.failed_attempts,
+                    locked_until    = EXCLUDED.locked_until
+            """, (ip, 0 if reached_limit else failed_attempts, new_lock))
+            conn.commit()
+            raise HTTPException(status_code=403, detail="No autorizado")
+
+        if failed_attempts or locked_until:
+            cursor.execute("""
+                UPDATE admin_auth_attempts SET failed_attempts = 0, locked_until = NULL
+                WHERE ip = %s
+            """, (ip,))
+            conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
 
 
 def auto_close_expired(cursor):
@@ -951,7 +1083,7 @@ class CreateEventBody(BaseModel):
 @app.post("/events")
 @limiter.limit("5/minute")
 def createEvent(request: Request, body: CreateEventBody, x_admin_key: Optional[str] = Header(None)):
-    check_admin(x_admin_key)
+    check_admin(request, x_admin_key)
 
     if body.metric not in VALID_METRICS:
         raise HTTPException(
@@ -1018,7 +1150,7 @@ def createEvent(request: Request, body: CreateEventBody, x_admin_key: Optional[s
 @app.patch("/events/{event_id}/close")
 @limiter.limit("5/minute")
 def closeEvent(request: Request, event_id: int, x_admin_key: Optional[str] = Header(None)):
-    check_admin(x_admin_key)
+    check_admin(request, x_admin_key)
 
     conn = get_conn()
     cursor = conn.cursor()
@@ -1055,7 +1187,7 @@ def closeEvent(request: Request, event_id: int, x_admin_key: Optional[str] = Hea
 @app.delete("/events/{event_id}")
 @limiter.limit("5/minute")
 def deleteEvent(request: Request, event_id: int, x_admin_key: Optional[str] = Header(None)):
-    check_admin(x_admin_key)
+    check_admin(request, x_admin_key)
 
     conn = get_conn()
     cursor = conn.cursor()
@@ -1160,6 +1292,36 @@ def ensure_raffle_tables(cursor):
     """)
 
 
+def ensure_predictions_table(cursor):
+    """
+    Predicción diaria de jugador del día. predictor_tag es quien predice,
+    target_day es el día que se está prediciendo (siempre "mañana" al
+    momento de crearse — nunca se puede predecir un día ya arrancado, ver
+    POST /predictions), y predicted_tag es a quién eligió.
+
+    Se resuelve (resolved_at, correct, winner_tag) una vez que target_day
+    ya pasó, comparando contra player_of_day. ticket_claimed evita el
+    doble cobro de los +2 tickets de una predicción acertada — igual que
+    daily_ticket_claims, la restricción real es la UNIQUE de abajo, no una
+    validación de aplicación.
+    """
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS player_predictions (
+            id             SERIAL PRIMARY KEY,
+            predictor_tag  TEXT NOT NULL,
+            target_day     DATE NOT NULL,
+            predicted_tag  TEXT NOT NULL,
+            created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            resolved_at    TIMESTAMPTZ,
+            correct        BOOLEAN,
+            winner_tag     TEXT,
+            ticket_claimed BOOLEAN NOT NULL DEFAULT FALSE,
+            UNIQUE (predictor_tag, target_day)
+        )
+    """)
+
+
 def uy_today():
     """Fecha de hoy en horario de Uruguay (UTC-3)."""
     from datetime import timedelta
@@ -1183,6 +1345,46 @@ def uy_month_bounds(year: int, month: int):
     return start, end
 
 
+PREDICTION_CORRECT_TICKETS = 2
+
+
+def resolve_predictions(cursor, today):
+    """
+    Resuelve toda predicción cuyo target_day ya haya terminado (< today) y
+    todavía no esté resuelta: compara predicted_tag contra el ganador real
+    en player_of_day para ese día. Si ese día no tiene fila en player_of_day
+    (nadie tuvo actividad — caso raro pero posible), se resuelve igual como
+    incorrecta, con winner_tag NULL, para que la predicción no quede
+    pendiente para siempre.
+
+    Es idempotente y liviana (solo toca filas con resolved_at IS NULL), así
+    que se puede llamar tanto desde el cron del collector como, a modo de
+    red de seguridad, desde la propia API antes de responder — el mismo
+    patrón que ya se usa para jugador del día (_compute_and_save_player_of_day
+    como fallback de lo que hace el collector cada 30 min).
+    """
+    cursor.execute("""
+        UPDATE player_predictions pp
+        SET resolved_at = NOW(),
+            winner_tag  = pod.player_tag,
+            correct     = (pp.predicted_tag = pod.player_tag)
+        FROM player_of_day pod
+        WHERE pp.target_day = pod.day
+          AND pp.resolved_at IS NULL
+          AND pp.target_day < %s
+    """, (today,))
+
+    cursor.execute("""
+        UPDATE player_predictions pp
+        SET resolved_at = NOW(),
+            winner_tag  = NULL,
+            correct     = FALSE
+        WHERE pp.resolved_at IS NULL
+          AND pp.target_day < %s
+          AND NOT EXISTS (SELECT 1 FROM player_of_day pod WHERE pod.day = pp.target_day)
+    """, (today,))
+
+
 def compute_raffle_tickets(cursor, month_start: datetime, month_end: datetime):
     """
     Devuelve la lista de TODOS los jugadores del club con su desglose de
@@ -1199,7 +1401,16 @@ def compute_raffle_tickets(cursor, month_start: datetime, month_end: datetime):
     potd_map = dict(cursor.fetchall())
 
     # 2) +1 por cada 100 trofeos netos ganados este mes (mismo patrón que el
-    #    cálculo de "jugador del día", pero con ventana mensual en vez de diaria)
+    #    cálculo de "jugador del día", pero con ventana mensual en vez de diaria).
+    #    Esta consulta tenía el mismo bug de raíz que ya se corrigió en jugador
+    #    del día, y acá era todavía peor: no existía ni siquiera el fallback a
+    #    "último valor antes de que arrancara la ventana" (prev_last). Si un
+    #    jugador tuvo un solo cambio de trofeos en TODO el mes (algo común,
+    #    dado que el historial solo guarda una fila cuando el valor cambia),
+    #    month_first == month_last (misma fila) y el cálculo daba "gained = 0"
+    #    aunque el jugador viniera de mucho más abajo desde el mes anterior.
+    #    Se agrega prev_last (último snapshot ANTES de que arrancara el mes) y
+    #    se usa como base preferida, igual que en jugador del día.
     cursor.execute("""
         WITH ranked AS (
             SELECT player_tag, trophies, timestamp,
@@ -1209,11 +1420,20 @@ def compute_raffle_tickets(cursor, month_start: datetime, month_end: datetime):
             WHERE timestamp >= %s AND timestamp < %s
         ),
         month_first AS (SELECT player_tag, trophies FROM ranked WHERE rn_asc = 1),
-        month_last  AS (SELECT player_tag, trophies FROM ranked WHERE rn_desc = 1)
-        SELECT ml.player_tag, GREATEST(0, ml.trophies - mf.trophies) AS gained
+        month_last  AS (SELECT player_tag, trophies FROM ranked WHERE rn_desc = 1),
+        prev_last AS (
+            SELECT DISTINCT ON (player_tag) player_tag, trophies
+            FROM player_stats_history
+            WHERE timestamp < %s
+            ORDER BY player_tag, timestamp DESC
+        )
+        SELECT
+            ml.player_tag,
+            GREATEST(0, COALESCE(ml.trophies, pv.trophies) - COALESCE(pv.trophies, mf.trophies, 0)) AS gained
         FROM month_last ml
-        JOIN month_first mf USING (player_tag)
-    """, (month_start, month_end))
+        LEFT JOIN month_first mf USING (player_tag)
+        LEFT JOIN prev_last  pv USING (player_tag)
+    """, (month_start, month_end, month_start))
     trophies_map = {tag: gained // 100 for tag, gained in cursor.fetchall()}
 
     # 3) tickets según posición final en torneos cerrados durante el mes
@@ -1241,7 +1461,21 @@ def compute_raffle_tickets(cursor, month_start: datetime, month_end: datetime):
     """, (month_start.date(), month_end.date()))
     daily_map = dict(cursor.fetchall())
 
-    # 5) combinar con la lista completa de jugadores actuales del club.
+    # 5) +2 tickets por cada predicción de jugador del día acertada y
+    #    reclamada este mes (ver POST /predictions/claim). Solo cuentan las
+    #    ya reclamadas por el usuario — igual que el resto de las fuentes,
+    #    que reflejan acciones ya confirmadas, no aciertos pendientes de
+    #    reclamar.
+    cursor.execute("""
+        SELECT predictor_tag, COUNT(*) * %s
+        FROM player_predictions
+        WHERE ticket_claimed = TRUE
+          AND target_day >= %s AND target_day < %s
+        GROUP BY predictor_tag
+    """, (PREDICTION_CORRECT_TICKETS, month_start.date(), month_end.date()))
+    prediction_map = dict(cursor.fetchall())
+
+    # 6) combinar con la lista completa de jugadores actuales del club.
     # Las cuentas baneadas quedan totalmente afuera del sorteo (ranking Y
     # elegibilidad) mientras dure el baneo.
     cursor.execute("SELECT player_tag FROM users WHERE banned = TRUE")
@@ -1256,6 +1490,7 @@ def compute_raffle_tickets(cursor, month_start: datetime, month_end: datetime):
         troph = trophies_map.get(tag, 0)
         ev = events_map.get(tag, 0)
         daily = daily_map.get(tag, 0)
+        pred = prediction_map.get(tag, 0)
         result.append({
             "tag": tag,
             "name": name,
@@ -1265,7 +1500,8 @@ def compute_raffle_tickets(cursor, month_start: datetime, month_end: datetime):
             "tickets_trophies": troph,
             "tickets_events": ev,
             "tickets_daily_claim": daily,
-            "tickets_total": potd + troph + ev + daily,
+            "tickets_predictions": pred,
+            "tickets_total": potd + troph + ev + daily + pred,
         })
 
     result.sort(key=lambda r: (-r["tickets_total"], r["name"] or ""))
@@ -1410,10 +1646,241 @@ class RaffleConfigBody(BaseModel):
     prize: str
 
 
+# ── PREDICCIÓN DE JUGADOR DEL DÍA ────────────────────────────────────────────
+# Cada día se puede predecir quién va a ganar jugador del día de MAÑANA.
+# target_day siempre se calcula server-side como "hoy + 1" — nunca lo manda
+# el cliente — así que no hay forma de tocar una predicción una vez que el
+# día que se estaba prediciendo ya arrancó: la próxima llamada a POST
+# /predictions solo puede afectar al nuevo "mañana". Acertar paga +2 tickets
+# para el sorteo, reclamables al día siguiente una vez resuelto (ver
+# resolve_predictions).
+
+class PredictionBody(BaseModel):
+    tag: str
+
+
+@app.get("/predictions/today")
+@limiter.limit("30/minute")
+def getPredictionsToday(request: Request, user=Depends(get_current_user)):
+    """
+    Devuelve todo lo que necesita el widget de predicciones:
+      - tomorrow: la predicción editable para mañana (o vacía si no eligió)
+      - today: tracking en vivo de la predicción hecha ayer para HOY
+        (líder actual, puntos del jugador predicho, puntos propios)
+      - yesterday_result: resultado ya resuelto de la predicción de ayer
+        (a quién predijo, quién ganó realmente, si acertó, si ya reclamó)
+      - pending_claims: total de aciertos sin reclamar (por si se acumuló
+        más de uno)
+    """
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        ensure_predictions_table(cursor)
+        ensure_player_of_day_table(cursor)
+        conn.commit()
+
+        from datetime import timedelta
+        today = uy_today()
+        tomorrow = today + timedelta(days=1)
+        yesterday = today - timedelta(days=1)
+        predictor_tag = user["tag"]
+
+        # Red de seguridad: resuelve cualquier predicción vencida por si el
+        # collector todavía no corrió desde la medianoche.
+        resolve_predictions(cursor, today)
+        conn.commit()
+
+        # ── Predicción para mañana (editable hasta las 00:00 UY) ────────
+        cursor.execute("""
+            SELECT pp.predicted_tag, p.name, p.icon_url
+            FROM player_predictions pp
+            LEFT JOIN players p ON p.tag = pp.predicted_tag
+            WHERE pp.predictor_tag = %s AND pp.target_day = %s
+        """, (predictor_tag, tomorrow))
+        row = cursor.fetchone()
+        tomorrow_block = {
+            "target_day": tomorrow.isoformat(),
+            "predicted_tag": row[0] if row else None,
+            "predicted_name": row[1] if row else None,
+            "predicted_icon_url": row[2] if row else None,
+            "lock_at": uy_next_midnight_utc().isoformat(),
+        }
+
+        # ── Tracking en vivo de la predicción de HOY (hecha ayer) ───────
+        cursor.execute("""
+            SELECT pp.predicted_tag, p.name, p.icon_url
+            FROM player_predictions pp
+            LEFT JOIN players p ON p.tag = pp.predicted_tag
+            WHERE pp.predictor_tag = %s AND pp.target_day = %s
+        """, (predictor_tag, today))
+        row = cursor.fetchone()
+        today_block = None
+        if row:
+            predicted_tag, predicted_name, predicted_icon = row
+            live_ranking = get_today_live_ranking(cursor, today)
+            by_tag = {r["player_tag"]: r for r in live_ranking}
+            leader = live_ranking[0] if live_ranking else None
+            today_block = {
+                "target_day": today.isoformat(),
+                "predicted_tag": predicted_tag,
+                "predicted_name": predicted_name,
+                "predicted_icon_url": predicted_icon,
+                "predicted_points": by_tag.get(predicted_tag, {}).get("points", 0),
+                "leader_tag": leader["player_tag"] if leader else None,
+                "leader_name": leader["player_name"] if leader else None,
+                "leader_icon_url": leader["icon_url"] if leader else None,
+                "leader_points": leader["points"] if leader else 0,
+                "own_points": by_tag.get(predictor_tag, {}).get("points", 0),
+            }
+
+        # ── Resultado de la predicción de AYER (ya resuelta) ────────────
+        cursor.execute("""
+            SELECT pp.predicted_tag, pred_p.name, pred_p.icon_url,
+                   pp.winner_tag, win_p.name, win_p.icon_url,
+                   pp.correct, pp.ticket_claimed
+            FROM player_predictions pp
+            LEFT JOIN players pred_p ON pred_p.tag = pp.predicted_tag
+            LEFT JOIN players win_p  ON win_p.tag  = pp.winner_tag
+            WHERE pp.predictor_tag = %s AND pp.target_day = %s AND pp.resolved_at IS NOT NULL
+        """, (predictor_tag, yesterday))
+        row = cursor.fetchone()
+        yesterday_block = None
+        if row:
+            (p_tag, p_name, p_icon, w_tag, w_name, w_icon, correct, claimed) = row
+            yesterday_block = {
+                "target_day": yesterday.isoformat(),
+                "predicted_tag": p_tag,
+                "predicted_name": p_name,
+                "predicted_icon_url": p_icon,
+                "winner_tag": w_tag,
+                "winner_name": w_name,
+                "winner_icon_url": w_icon,
+                "correct": bool(correct),
+                "ticket_claimed": bool(claimed),
+            }
+
+        cursor.execute("""
+            SELECT COUNT(*) FROM player_predictions
+            WHERE predictor_tag = %s AND correct = TRUE AND ticket_claimed = FALSE
+        """, (predictor_tag,))
+        pending_claims = cursor.fetchone()[0]
+
+        return {
+            "tomorrow": tomorrow_block,
+            "today": today_block,
+            "yesterday_result": yesterday_block,
+            "pending_claims": pending_claims,
+        }
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.post("/predictions")
+@limiter.limit("10/minute")
+def submitPrediction(request: Request, body: PredictionBody, user=Depends(get_current_user)):
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        ensure_predictions_table(cursor)
+        ensure_users_table(cursor)
+
+        cursor.execute("SELECT banned FROM users WHERE player_tag = %s", (user["tag"],))
+        row = cursor.fetchone()
+        if row and row[0]:
+            raise HTTPException(status_code=403, detail="Tu cuenta está suspendida.")
+
+        predicted_tag = normalize_tag(body.tag)
+        if not TAG_RE.match(predicted_tag):
+            raise HTTPException(status_code=400, detail="Tag inválida.")
+
+        cursor.execute("SELECT 1 FROM players WHERE tag = %s", (predicted_tag,))
+        if not cursor.fetchone():
+            raise HTTPException(
+                status_code=400,
+                detail="Ese jugador no está activo en ninguno de los 4 clubes en este momento."
+            )
+
+        from datetime import timedelta
+        tomorrow = uy_today() + timedelta(days=1)
+
+        cursor.execute("""
+            INSERT INTO player_predictions (predictor_tag, target_day, predicted_tag, updated_at)
+            VALUES (%s, %s, %s, NOW())
+            ON CONFLICT (predictor_tag, target_day) DO UPDATE SET
+                predicted_tag = EXCLUDED.predicted_tag,
+                updated_at    = NOW()
+        """, (user["tag"], tomorrow, predicted_tag))
+        conn.commit()
+
+        return {"ok": True, "target_day": tomorrow.isoformat(), "predicted_tag": predicted_tag}
+    except HTTPException:
+        raise
+    except Exception:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail="No se pudo guardar tu predicción.")
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.post("/predictions/claim")
+@limiter.limit("10/minute")
+def claimPredictionTickets(request: Request, user=Depends(get_current_user)):
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        ensure_predictions_table(cursor)
+        ensure_users_table(cursor)
+
+        cursor.execute("SELECT banned FROM users WHERE player_tag = %s", (user["tag"],))
+        row = cursor.fetchone()
+        if row and row[0]:
+            raise HTTPException(status_code=403, detail="Tu cuenta está suspendida.")
+
+        today = uy_today()
+        resolve_predictions(cursor, today)
+
+        # Reclama TODOS los aciertos pendientes de una sola vez (no solo el
+        # de ayer) para que no se pierdan tickets si el usuario se salteó
+        # algún día sin entrar al sitio. La restricción real contra el
+        # doble cobro es el propio WHERE ticket_claimed = FALSE bajo el
+        # bloqueo de fila de Postgres — no una validación de aplicación.
+        cursor.execute("""
+            UPDATE player_predictions
+            SET ticket_claimed = TRUE
+            WHERE predictor_tag = %s AND correct = TRUE AND ticket_claimed = FALSE
+            RETURNING id
+        """, (user["tag"],))
+        claimed_ids = cursor.fetchall()
+        conn.commit()
+
+        count = len(claimed_ids)
+        if count == 0:
+            raise HTTPException(
+                status_code=409,
+                detail="No tenés predicciones acertadas pendientes de reclamar."
+            )
+
+        return {
+            "ok": True,
+            "predictions_claimed": count,
+            "tickets": count * PREDICTION_CORRECT_TICKETS,
+        }
+    except HTTPException:
+        raise
+    except Exception:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail="No se pudieron reclamar los tickets.")
+    finally:
+        cursor.close()
+        conn.close()
+
+
 @app.patch("/raffle/config")
 @limiter.limit("5/minute")
 def updateRaffleConfig(request: Request, body: RaffleConfigBody, x_admin_key: Optional[str] = Header(None)):
-    check_admin(x_admin_key)
+    check_admin(request, x_admin_key)
     prize = (body.prize or "").strip()
     if not prize:
         raise HTTPException(status_code=400, detail="El premio no puede estar vacío.")
@@ -1449,7 +1916,7 @@ def drawRaffle(request: Request, x_admin_key: Optional[str] = Header(None)):
     en cada corrida automática; también sirve como botón de emergencia para
     el admin si por algún motivo el sorteo automático no se disparó.
     """
-    check_admin(x_admin_key)
+    check_admin(request, x_admin_key)
     from datetime import date as date_cls, timedelta
 
     conn = get_conn()
@@ -1522,7 +1989,7 @@ def redrawRaffle(request: Request, body: RedrawBody, x_admin_key: Optional[str] 
     de participantes no cambia, solo se vuelve a tirar el dado excluyendo a
     quienes ya tuvieron su oportunidad.
     """
-    check_admin(x_admin_key)
+    check_admin(request, x_admin_key)
     from datetime import date as date_cls
 
     try:
@@ -1694,6 +2161,78 @@ def ensure_player_of_day_table(cursor):
     """)
 
 
+def get_today_live_ranking(cursor, today):
+    """
+    Ranking en vivo del día `today` (deltas contra el último valor antes de
+    las 00:00 UY), el mismo cálculo que usa /player-of-day. Factorizado acá
+    para que el widget de predicciones pueda mostrar "puntos de hoy" del
+    jugador predicho y del propio usuario sin duplicar por tercera vez esta
+    consulta (ya delicada — ver el fix del bug de COALESCE más arriba).
+    """
+    from datetime import timedelta
+    day_start = datetime(today.year, today.month, today.day,
+                         3, 0, 0, tzinfo=timezone.utc)
+    day_end   = day_start + timedelta(hours=24)
+
+    cursor.execute("""
+        WITH ranked AS (
+            SELECT player_tag, trophies, wins3v3, winssolo, total_prestige, timestamp,
+                   ROW_NUMBER() OVER (PARTITION BY player_tag ORDER BY timestamp ASC)  AS rn_asc,
+                   ROW_NUMBER() OVER (PARTITION BY player_tag ORDER BY timestamp DESC) AS rn_desc
+            FROM player_stats_history
+            WHERE timestamp >= %s AND timestamp < %s
+        ),
+        day_first AS (SELECT player_tag, trophies, wins3v3, winssolo, total_prestige FROM ranked WHERE rn_asc  = 1),
+        day_last  AS (SELECT player_tag, trophies, wins3v3, winssolo, total_prestige FROM ranked WHERE rn_desc = 1),
+        prev_last AS (
+            SELECT DISTINCT ON (player_tag) player_tag, trophies, wins3v3, winssolo, total_prestige
+            FROM player_stats_history WHERE timestamp < %s
+            ORDER BY player_tag, timestamp DESC
+        )
+        SELECT
+            dl.player_tag,
+            p.name, p.icon_url, p.club_name,
+            -- BASE del día = último valor ANTES de las 00:00 UY (pv), no
+            -- el primer cambio registrado DENTRO del día (df). El
+            -- historial solo guarda una fila cuando el valor cambia, así
+            -- que "df" puede ser la única fila de hoy y coincidir con
+            -- "dl" -> delta 0 aunque el jugador sí progresó. pv siempre
+            -- representa el valor real a las 00:00 UY.
+            GREATEST(0, COALESCE(dl.trophies,       pv.trophies)       - COALESCE(pv.trophies,       df.trophies,       0)) AS dt,
+            GREATEST(0, COALESCE(dl.wins3v3,        pv.wins3v3)        - COALESCE(pv.wins3v3,        df.wins3v3,        0)) AS dw3,
+            GREATEST(0, COALESCE(dl.winssolo,       pv.winssolo)       - COALESCE(pv.winssolo,       df.winssolo,       0)) AS dws,
+            GREATEST(0, COALESCE(dl.total_prestige, pv.total_prestige) - COALESCE(pv.total_prestige, df.total_prestige, 0)) AS dp
+        FROM day_last dl
+        LEFT JOIN day_first df USING (player_tag)
+        LEFT JOIN prev_last  pv USING (player_tag)
+        JOIN players p ON p.tag = dl.player_tag
+        ORDER BY (
+            GREATEST(0, COALESCE(dl.trophies,       pv.trophies)       - COALESCE(pv.trophies,       df.trophies,       0)) * 1 +
+            GREATEST(0, COALESCE(dl.wins3v3,        pv.wins3v3)        - COALESCE(pv.wins3v3,        df.wins3v3,        0)) * 4 +
+            GREATEST(0, COALESCE(dl.winssolo,       pv.winssolo)       - COALESCE(pv.winssolo,       df.winssolo,       0)) * 4 +
+            GREATEST(0, COALESCE(dl.total_prestige, pv.total_prestige) - COALESCE(pv.total_prestige, df.total_prestige, 0)) * 80
+        ) DESC, dl.player_tag ASC
+    """, (day_start, day_end, day_start))
+
+    today_rows = cursor.fetchall()
+    today_ranking = []
+    for i, (tag, name, icon_url, club_name, dt, dw3, dws, dp) in enumerate(today_rows):
+        points = dt * 1 + (dw3 + dws) * 4 + dp * 80
+        today_ranking.append({
+            "rank":           i + 1,
+            "player_tag":     tag,
+            "player_name":    name,
+            "icon_url":       icon_url,
+            "club_name":      club_name,
+            "points":         points,
+            "delta_trophies": dt,
+            "delta_wins3v3":  dw3,
+            "delta_winsSolo": dws,
+            "delta_prestige": dp,
+        })
+    return today_ranking
+
+
 @app.get("/player-of-day/winners")
 @limiter.limit("20/minute")
 def getPlayerOfDayWinners(request: Request):
@@ -1762,66 +2301,7 @@ def getPlayerOfDay(request: Request):
             conn.commit()
 
         # ── Ranking de hoy en vivo (top 20 con deltas) ──────────────────
-        day_start = datetime(today.year, today.month, today.day,
-                             3, 0, 0, tzinfo=timezone.utc)
-        day_end   = day_start + timedelta(hours=24)
-
-        cursor.execute("""
-            WITH ranked AS (
-                SELECT player_tag, trophies, wins3v3, winssolo, total_prestige, timestamp,
-                       ROW_NUMBER() OVER (PARTITION BY player_tag ORDER BY timestamp ASC)  AS rn_asc,
-                       ROW_NUMBER() OVER (PARTITION BY player_tag ORDER BY timestamp DESC) AS rn_desc
-                FROM player_stats_history
-                WHERE timestamp >= %s AND timestamp < %s
-            ),
-            day_first AS (SELECT player_tag, trophies, wins3v3, winssolo, total_prestige FROM ranked WHERE rn_asc  = 1),
-            day_last  AS (SELECT player_tag, trophies, wins3v3, winssolo, total_prestige FROM ranked WHERE rn_desc = 1),
-            prev_last AS (
-                SELECT DISTINCT ON (player_tag) player_tag, trophies, wins3v3, winssolo, total_prestige
-                FROM player_stats_history WHERE timestamp < %s
-                ORDER BY player_tag, timestamp DESC
-            )
-            SELECT
-                dl.player_tag,
-                p.name, p.icon_url, p.club_name,
-                -- BASE del día = último valor ANTES de las 00:00 UY (pv), no
-                -- el primer cambio registrado DENTRO del día (df). El
-                -- historial solo guarda una fila cuando el valor cambia, así
-                -- que "df" puede ser la única fila de hoy y coincidir con
-                -- "dl" -> delta 0 aunque el jugador sí progresó. pv siempre
-                -- representa el valor real a las 00:00 UY.
-                GREATEST(0, COALESCE(dl.trophies,       pv.trophies)       - COALESCE(pv.trophies,       df.trophies,       0)) AS dt,
-                GREATEST(0, COALESCE(dl.wins3v3,        pv.wins3v3)        - COALESCE(pv.wins3v3,        df.wins3v3,        0)) AS dw3,
-                GREATEST(0, COALESCE(dl.winssolo,       pv.winssolo)       - COALESCE(pv.winssolo,       df.winssolo,       0)) AS dws,
-                GREATEST(0, COALESCE(dl.total_prestige, pv.total_prestige) - COALESCE(pv.total_prestige, df.total_prestige, 0)) AS dp
-            FROM day_last dl
-            LEFT JOIN day_first df USING (player_tag)
-            LEFT JOIN prev_last  pv USING (player_tag)
-            JOIN players p ON p.tag = dl.player_tag
-            ORDER BY (
-                GREATEST(0, COALESCE(dl.trophies,       pv.trophies)       - COALESCE(pv.trophies,       df.trophies,       0)) * 1 +
-                GREATEST(0, COALESCE(dl.wins3v3,        pv.wins3v3)        - COALESCE(pv.wins3v3,        df.wins3v3,        0)) * 4 +
-                GREATEST(0, COALESCE(dl.winssolo,       pv.winssolo)       - COALESCE(pv.winssolo,       df.winssolo,       0)) * 4 +
-                GREATEST(0, COALESCE(dl.total_prestige, pv.total_prestige) - COALESCE(pv.total_prestige, df.total_prestige, 0)) * 80
-            ) DESC, dl.player_tag ASC
-        """, (day_start, day_end, day_start))
-
-        today_rows = cursor.fetchall()
-        today_ranking = []
-        for i, (tag, name, icon_url, club_name, dt, dw3, dws, dp) in enumerate(today_rows):
-            points = dt * 1 + (dw3 + dws) * 4 + dp * 80
-            today_ranking.append({
-                "rank":           i + 1,
-                "player_tag":     tag,
-                "player_name":    name,
-                "icon_url":       icon_url,
-                "club_name":      club_name,
-                "points":         points,
-                "delta_trophies": dt,
-                "delta_wins3v3":  dw3,
-                "delta_winsSolo": dws,
-                "delta_prestige": dp,
-            })
+        today_ranking = get_today_live_ranking(cursor, today)
 
         # ── Historial: ganadores de días anteriores (últimos 7, sin hoy) ─
         cursor.execute("""
