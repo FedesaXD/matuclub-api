@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from datetime import datetime, timezone
 from typing import Optional, List
@@ -50,6 +50,22 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         return response
 
 app.add_middleware(SecurityHeadersMiddleware)
+
+# ── TrustedHost: valida el header Host de cada request ───────────────────────
+# Estaba importado pero nunca se llegaba a activar con add_middleware(), así
+# que no hacía nada. Se agrega ÚLTIMO (ver comentario de CORS arriba: en
+# Starlette el último middleware agregado es el que se ejecuta PRIMERO), para
+# que una request con un Host inválido se rechace antes de llegar a CORS o a
+# cualquier lógica de negocio.
+#
+# Por defecto queda en "*" (sin restricción, igual que el comportamiento
+# actual) para no romper nada si no se configura nada. Para endurecerlo,
+# setear ALLOWED_HOSTS en Render con el/los dominio(s) reales separados por
+# coma (p. ej. "matuclub-api.onrender.com"). Con "*" en la lista (el default),
+# TrustedHostMiddleware no valida nada — es un no-op explícito, no una
+# restricción real, hasta que se configure.
+ALLOWED_HOSTS = [h.strip() for h in os.getenv("ALLOWED_HOSTS", "*").split(",") if h.strip()] or ["*"]
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 
 # ── Rate limiter: leer IP real detrás del proxy de Render ────────────────────
 def get_real_ip(request: Request) -> str:
@@ -127,8 +143,38 @@ MAX_LOGIN_ATTEMPTS = 8
 LOGIN_LOCKOUT_MINUTES = 15
 
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9_]{3,20}$")
-PASSWORD_RE = re.compile(r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$")
+# Tope superior agregado (antes era ".{8,}", sin límite de longitud alguno).
+# El mínimo de 8 y los requisitos de mayúscula/minúscula/dígito no cambian.
+#
+# El valor 72 no es arbitrario: es el límite real y duro de bcrypt (la
+# librería usada más abajo para hashear). Se comprobó al testear el fix que
+# bcrypt.hashpw()/checkpw() de la versión instalada (bcrypt>=4.0) levantan
+# ValueError si la contraseña supera 72 BYTES — no la truncan en silencio.
+# Es decir que antes de este fix, cualquier contraseña de más de 72 bytes ya
+# rompía el registro y el login con un 500 ("no se pudo completar..."), no
+# solo dejaba pasar payloads grandes sin sentido. Por eso, además del tope
+# por caracteres acá y en los modelos (Field(max_length=...)), se agrega más
+# abajo una verificación explícita en bytes (UTF-8) antes de llamar a bcrypt,
+# para cubrir contraseñas con caracteres no-ASCII (tildes, emojis, etc.) que
+# podrían tener ≤72 caracteres pero más de 72 bytes.
+PASSWORD_MAX_LENGTH = 72
+PASSWORD_RE = re.compile(r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,72}$")
 TAG_RE = re.compile(r"^#[0-9A-Z]{3,15}$")
+
+
+def reject_if_password_too_many_bytes(password: str):
+    """
+    Chequeo defensivo adicional al de caracteres: bcrypt trabaja en bytes,
+    no en caracteres. Un password con acentos/emojis podría tener <=72
+    caracteres (pasa PASSWORD_RE) y aun así pesar más de 72 bytes en UTF-8,
+    lo que haría explotar bcrypt.hashpw/checkpw con un ValueError sin este
+    chequeo.
+    """
+    if len((password or "").encode("utf-8")) > PASSWORD_MAX_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Entre 8 y {PASSWORD_MAX_LENGTH} caracteres, con mayúsculas, minúsculas y números."
+        )
 
 
 def normalize_tag(tag: str) -> str:
@@ -226,15 +272,53 @@ def ensure_users_table(cursor):
     cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS banned_at TIMESTAMPTZ")
 
 
+def ensure_login_attempts_table(cursor):
+    """
+    Contador de intentos fallidos de login por (usuario, IP).
+
+    Antes, el bloqueo de MAX_LOGIN_ATTEMPTS vivía únicamente en
+    users.failed_attempts/locked_until, es decir, por CUENTA completa sin
+    importar de dónde vinieran los intentos. Eso significa que cualquiera
+    que supiera (o adivinara) un username podía mandar contraseñas
+    incorrectas y dejar esa cuenta bloqueada 15 minutos, indefinidamente,
+    sin necesitar la contraseña ni estar autenticado — un DoS dirigido
+    contra cualquier usuario conocido.
+
+    Esta tabla nueva bloquea por la COMBINACIÓN (usuario, IP): un atacante
+    desde su propia IP sigue quedando bloqueado tras varios intentos
+    fallidos contra una cuenta (se mantiene la protección contra fuerza
+    bruta), pero eso ya no le impide al dueño real de la cuenta loguearse
+    con su contraseña correcta desde su propia conexión.
+
+    Las columnas users.failed_attempts/locked_until se siguen actualizando
+    en login() exactamente igual que antes — el panel de admin las lee en
+    GET /admin/users y eso no cambia — pero dejan de ser lo que decide si
+    se bloquea o no un intento de login; esa decisión ahora la toma esta
+    tabla.
+    """
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS login_attempts (
+            username_lower   TEXT NOT NULL,
+            ip               TEXT NOT NULL,
+            failed_attempts  INTEGER NOT NULL DEFAULT 0,
+            locked_until     TIMESTAMPTZ,
+            PRIMARY KEY (username_lower, ip)
+        )
+    """)
+
+
 class RegisterBody(BaseModel):
     username: str
     tag: str
-    password: str
+    # max_length acá corta un payload gigante ANTES de correrle el regex o
+    # el hash de bcrypt (que igual trunca a 72 bytes internamente). No
+    # afecta a ninguna contraseña real: nadie usa 128+ caracteres.
+    password: str = Field(..., max_length=PASSWORD_MAX_LENGTH)
 
 
 class LoginBody(BaseModel):
     username: str
-    password: str
+    password: str = Field(..., max_length=PASSWORD_MAX_LENGTH)
 
 
 @app.post("/auth/register")
@@ -249,7 +333,11 @@ def register(request: Request, body: RegisterBody):
         raise HTTPException(status_code=400, detail="Tag de Brawl Stars inválida.")
 
     if not PASSWORD_RE.match(body.password or ""):
-        raise HTTPException(status_code=400, detail="Mínimo 8 caracteres, con mayúsculas, minúsculas y números.")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Entre 8 y {PASSWORD_MAX_LENGTH} caracteres, con mayúsculas, minúsculas y números."
+        )
+    reject_if_password_too_many_bytes(body.password)
 
     conn = get_conn()
     cursor = conn.cursor()
@@ -292,14 +380,23 @@ def register(request: Request, body: RegisterBody):
 @limiter.limit("10/minute")
 def login(request: Request, body: LoginBody):
     username = (body.username or "").strip().lower()
+    ip = get_real_ip(request)
     generic_error = HTTPException(status_code=401, detail="Usuario o contraseña incorrectos.")
     if not username or not body.password:
+        raise generic_error
+    if len(body.password.encode("utf-8")) > PASSWORD_MAX_LENGTH:
+        # Un candidato de más de 72 bytes nunca puede ser la contraseña
+        # correcta (ver PASSWORD_MAX_LENGTH / reject_if_password_too_many_bytes):
+        # ninguna cuenta puede tener una así hasheada desde que también se
+        # capó en /auth/register. Cortamos acá mismo para no pasarle a
+        # bcrypt.checkpw un candidato que lo hace explotar con ValueError.
         raise generic_error
 
     conn = get_conn()
     cursor = conn.cursor()
     try:
         ensure_users_table(cursor)
+        ensure_login_attempts_table(cursor)
         cursor.execute("""
             SELECT id, username, player_tag, password_hash, failed_attempts, locked_until, banned, banned_reason
             FROM users WHERE username_lower = %s
@@ -315,7 +412,17 @@ def login(request: Request, body: LoginBody):
                 detail="Esta cuenta fue suspendida" + (f": {banned_reason}" if banned_reason else ".")
             )
 
-        if locked_until and locked_until > datetime.now(timezone.utc):
+        # Gate real de bloqueo: por (usuario, IP), no por la cuenta entera
+        # (ver ensure_login_attempts_table). users.locked_until de arriba
+        # YA NO se usa para decidir si se bloquea esta request.
+        cursor.execute(
+            "SELECT failed_attempts, locked_until FROM login_attempts WHERE username_lower = %s AND ip = %s",
+            (username, ip)
+        )
+        la_row = cursor.fetchone()
+        ip_failed_attempts, ip_locked_until = la_row if la_row else (0, None)
+
+        if ip_locked_until and ip_locked_until > datetime.now(timezone.utc):
             raise HTTPException(
                 status_code=429,
                 detail="Cuenta bloqueada temporalmente por demasiados intentos fallidos. Probá de nuevo en unos minutos."
@@ -324,19 +431,36 @@ def login(request: Request, body: LoginBody):
         if not bcrypt.checkpw(body.password.encode("utf-8"), pw_hash.encode("utf-8")):
             from datetime import timedelta
             failed_attempts += 1
+            ip_failed_attempts += 1
             reached_limit = failed_attempts >= MAX_LOGIN_ATTEMPTS
+            ip_reached_limit = ip_failed_attempts >= MAX_LOGIN_ATTEMPTS
             new_lock = (datetime.now(timezone.utc) + timedelta(minutes=LOGIN_LOCKOUT_MINUTES)) if reached_limit else None
-            # Al bloquear, reiniciamos el contador para que el próximo ciclo de
-            # intentos (una vez pasado el bloqueo) empiece de cero.
+            ip_new_lock = (datetime.now(timezone.utc) + timedelta(minutes=LOGIN_LOCKOUT_MINUTES)) if ip_reached_limit else None
+
+            # Contador agregado por cuenta: se mantiene igual que antes,
+            # solo para que lo siga mostrando GET /admin/users. Ya no
+            # bloquea nada por sí solo.
             cursor.execute("""
                 UPDATE users SET failed_attempts = %s, locked_until = %s WHERE id = %s
             """, (0 if reached_limit else failed_attempts, new_lock, user_id))
+            # Contador real que sí bloquea, acotado a esta IP puntual.
+            cursor.execute("""
+                INSERT INTO login_attempts (username_lower, ip, failed_attempts, locked_until)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (username_lower, ip) DO UPDATE SET
+                    failed_attempts = EXCLUDED.failed_attempts,
+                    locked_until    = EXCLUDED.locked_until
+            """, (username, ip, 0 if ip_reached_limit else ip_failed_attempts, ip_new_lock))
             conn.commit()
             raise generic_error
 
         cursor.execute("""
             UPDATE users SET failed_attempts = 0, locked_until = NULL, last_login_at = NOW() WHERE id = %s
         """, (user_id,))
+        cursor.execute(
+            "DELETE FROM login_attempts WHERE username_lower = %s AND ip = %s",
+            (username, ip)
+        )
         conn.commit()
 
         token = create_access_token(user_id, real_username, tag)
@@ -1071,9 +1195,12 @@ class TicketReward(BaseModel):
 
 
 class CreateEventBody(BaseModel):
-    title: str
-    description: Optional[str] = None
-    reward: str
+    # Solo se agrega tope MÁXIMO (max_length); no se agrega min_length ni
+    # se cambia nada del resto de las validaciones que ya hace el handler
+    # (metric, brawler_name, duration_hours, ticket_rewards siguen igual).
+    title: str = Field(..., max_length=200)
+    description: Optional[str] = Field(None, max_length=2000)
+    reward: str = Field(..., max_length=300)
     metric: str = "trophies"
     brawler_name: Optional[str] = None   # required when metric == brawler_trophies
     duration_hours: float
@@ -1643,7 +1770,7 @@ def claimDaily(request: Request, user=Depends(get_current_user)):
 
 
 class RaffleConfigBody(BaseModel):
-    prize: str
+    prize: str = Field(..., max_length=300)
 
 
 # ── PREDICCIÓN DE JUGADOR DEL DÍA ────────────────────────────────────────────
