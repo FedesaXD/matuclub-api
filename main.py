@@ -1615,6 +1615,16 @@ def compute_raffle_tickets(cursor, month_start: datetime, month_end: datetime):
     # 6) combinar con la lista completa de jugadores actuales del club.
     # Las cuentas baneadas quedan totalmente afuera del sorteo (ranking Y
     # elegibilidad) mientras dure el baneo.
+    #
+    # Nota sobre cuentas con tag ajena a los 4 clubes: el resultado de esta
+    # función se arma iterando `players` (más abajo), tabla que
+    # datacollector.py llena únicamente con los miembros reales de los 4
+    # clubes. Una cuenta cuya tag no pertenezca a ninguno jamás va a tener
+    # fila en `players`, así que ni aparece en el ranking ni puede ser
+    # elegida en /raffle/draw (que sortea sobre este mismo resultado) —
+    # aunque hubiera acumulado tickets en otras tablas (daily_ticket_claims,
+    # player_predictions), esos valores simplemente nunca se leen para un
+    # tag que no está en este loop. No hace falta un chequeo aparte acá.
     cursor.execute("SELECT player_tag FROM users WHERE banned = TRUE")
     banned_tags = {row[0] for row in cursor.fetchall()}
 
@@ -1719,8 +1729,16 @@ def getClaimDailyStatus(request: Request, user=Depends(get_current_user)):
         """, (user["tag"], today))
         claimed = cursor.fetchone() is not None
 
+        # No bloquea nada acá (eso lo sigue haciendo POST /raffle/claim-daily
+        # contra la base, fresco, en cada intento) — es solo para que el
+        # frontend pueda mostrar el botón deshabilitado en vez de dejar que
+        # el usuario reciba un 403 recién al tocarlo.
+        cursor.execute("SELECT 1 FROM players WHERE tag = %s", (user["tag"],))
+        eligible = cursor.fetchone() is not None
+
         return {
             "claimed_today": claimed,
+            "eligible": eligible,
             "tickets": DAILY_CLAIM_TICKETS,
             "next_claim_at": uy_next_midnight_utc().isoformat(),
         }
@@ -1902,7 +1920,15 @@ def getPredictionsToday(request: Request, user=Depends(get_current_user)):
         """, (predictor_tag,))
         pending_claims = cursor.fetchone()[0]
 
+        # Mismo propósito que en GET /raffle/claim-daily: no bloquea nada acá
+        # (POST /predictions y POST /predictions/claim vuelven a chequear
+        # esto fresco contra la base), solo le permite al frontend deshabilitar
+        # el widget de predicciones para cuentas no-miembro sin esperar a un 403.
+        cursor.execute("SELECT 1 FROM players WHERE tag = %s", (predictor_tag,))
+        eligible = cursor.fetchone() is not None
+
         return {
+            "eligible": eligible,
             "tomorrow": tomorrow_block,
             "today": today_block,
             "yesterday_result": yesterday_block,
@@ -1926,6 +1952,19 @@ def submitPrediction(request: Request, body: PredictionBody, user=Depends(get_cu
         row = cursor.fetchone()
         if row and row[0]:
             raise HTTPException(status_code=403, detail="Tu cuenta está suspendida.")
+
+        # Gap: acá se validaba que el jugador PREDICHO (predicted_tag, más
+        # abajo) fuera miembro de un club, pero nunca que quien predice
+        # (user["tag"]) también lo sea. Una cuenta creada con una tag ajena
+        # a los 4 clubes podía predecir sin problema — solo no podía elegir
+        # a otro no-miembro como resultado. Mismo criterio y mismo mensaje
+        # que ya usa POST /raffle/claim-daily para este caso.
+        cursor.execute("SELECT 1 FROM players WHERE tag = %s", (user["tag"],))
+        if not cursor.fetchone():
+            raise HTTPException(
+                status_code=403,
+                detail="Tu tag no corresponde a un jugador activo del club en este momento."
+            )
 
         predicted_tag = normalize_tag(body.tag)
         if not TAG_RE.match(predicted_tag):
@@ -1974,6 +2013,18 @@ def claimPredictionTickets(request: Request, user=Depends(get_current_user)):
         row = cursor.fetchone()
         if row and row[0]:
             raise HTTPException(status_code=403, detail="Tu cuenta está suspendida.")
+
+        # Defensa en profundidad: con el fix de POST /predictions una cuenta
+        # no-miembro ya no puede generar predicciones nuevas, pero esto cubre
+        # además al que predijo siendo miembro y para cuando llega a reclamar
+        # ya dejó el club (su fila en `players` se borra a las 24hs de irse,
+        # ver datacollector.py). Mismo criterio que el resto de las acciones.
+        cursor.execute("SELECT 1 FROM players WHERE tag = %s", (user["tag"],))
+        if not cursor.fetchone():
+            raise HTTPException(
+                status_code=403,
+                detail="Tu tag no corresponde a un jugador activo del club en este momento."
+            )
 
         today = uy_today()
         resolve_predictions(cursor, today)
