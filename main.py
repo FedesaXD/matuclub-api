@@ -1362,6 +1362,16 @@ def deleteEvent(request: Request, event_id: int, x_admin_key: Optional[str] = He
 # minutos) llamando a POST /raffle/draw con la clave de admin: el endpoint
 # es idempotente por mes, así que no hay riesgo de sortear dos veces.
 
+# Meses excluidos EXPLÍCITAMENTE del sorteo: nunca deben generar una fila
+# en raffle_draws, ni siquiera una "vacía" o marcada como excluida — el
+# objetivo es que no quede ningún registro de que ese sorteo existió.
+# Agosto 2026 fue el mes de testing del sistema (antes de que Sorteos
+# estuviera realmente en producción), así que se excluye a mano acá.
+# Si en el futuro hace falta excluir otro mes por el mismo motivo, se
+# agrega otra fecha a este set.
+EXCLUDED_RAFFLE_MONTHS = {datetime(2026, 8, 1).date()}
+
+
 def ensure_raffle_tables(cursor):
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS event_ticket_rules (
@@ -2057,6 +2067,12 @@ def drawRaffle(request: Request, x_admin_key: Optional[str] = Header(None)):
         else:
             prev_year, prev_month = now_uy.year, now_uy.month - 1
         cycle_date = date_cls(prev_year, prev_month, 1)
+
+        if cycle_date in EXCLUDED_RAFFLE_MONTHS:
+            # No se toca la base de datos para este mes: ni se lee ni se
+            # escribe nada en raffle_draws, para que no quede ningún rastro
+            # de que este ciclo existió.
+            return {"ok": True, "skipped": True, "reason": "Mes excluido del sorteo."}
 
         cursor.execute("SELECT 1 FROM raffle_draws WHERE cycle_month = %s", (cycle_date,))
         if cursor.fetchone():
