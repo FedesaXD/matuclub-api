@@ -2,6 +2,7 @@ import os
 import re
 import random
 import secrets
+import threading
 import bcrypt
 import jwt as pyjwt
 import psycopg2
@@ -122,6 +123,42 @@ CLUBS = {
 
 def get_conn():
     return psycopg2.connect(os.getenv("DATABASE_URL"), connect_timeout=10)
+
+
+# ── OPTIMIZACIÓN CU-hrs: cache en memoria de "tabla ya existe" ─────────────
+# Casi todos los endpoints empiezan llamando a uno o más ensure_X_table(cursor)
+# para garantizar que su(s) tabla(s)/columna(s) existan (CREATE TABLE IF NOT
+# EXISTS / ALTER TABLE ADD COLUMN IF NOT EXISTS). Eso está bien la primera
+# vez, pero en producción la tabla YA existe casi siempre — y aun así, cada
+# ensure_X_table() vuelve a mandar esas sentencias a Postgres en CADA
+# request, cada una como un round-trip de red aparte. Con decenas de
+# endpoints haciendo esto en cada llamada, es trabajo puro desperdiciado que
+# mantiene más tiempo del necesario despierto el compute de Neon.
+#
+# _SCHEMA_READY memoiza, EN MEMORIA y por proceso, qué tablas ya se
+# confirmaron: cada ensure_X_table() de más abajo chequea esto primero y,
+# si ya está marcada, no toca la base para nada. La primera vez que se
+# necesita de verdad, corre su DDL y lo comitea de inmediato con
+# cursor.connection.commit() — SIEMPRE es lo primero que se ejecuta en su
+# conexión (así están escritos todos los endpoints), así que ese commit
+# nunca confirma ni afecta ningún otro trabajo de la request.
+#
+# Por qué el commit inmediato en vez de dejar que lo comitee el
+# conn.commit() de más abajo en cada endpoint (como pasaba antes): sin esto,
+# si una request fallara justo después del ensure pero antes de su propio
+# commit, Postgres revertiría también la creación de tabla al cerrarse la
+# conexión sin confirmar — antes no importaba porque la siguiente request
+# volvía a intentar el mismo DDL idempotente sin más costo que ese; pero con
+# la memoria en proceso, ese reintento automático ya no pasa, así que hace
+# falta comitear acá mismo para garantizar que, la primera vez que se marca
+# algo como "listo", ya haya quedado escrito de verdad en la base.
+#
+# Nada de esto cambia el comportamiento hacia afuera: cada ensure_X_table()
+# sigue garantizando que su tabla exista antes de continuar, exactamente
+# igual que antes — solo que, salvo la primera vez por proceso, no vuelve a
+# tocar la base para confirmarlo.
+_schema_lock = threading.Lock()
+_SCHEMA_READY = set()
 
 
 # ── AUTH: config ──────────────────────────────────────────────────────────
@@ -254,22 +291,29 @@ def get_current_user(authorization: Optional[str] = Header(None)):
 # un JWT que el front-end guarda y reenvía en el header Authorization.
 
 def ensure_users_table(cursor):
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id               SERIAL PRIMARY KEY,
-            username         TEXT NOT NULL,
-            username_lower   TEXT NOT NULL UNIQUE,
-            player_tag       TEXT NOT NULL UNIQUE,
-            password_hash    TEXT NOT NULL,
-            created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            last_login_at    TIMESTAMPTZ,
-            failed_attempts  INTEGER NOT NULL DEFAULT 0,
-            locked_until     TIMESTAMPTZ
-        )
-    """)
-    cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS banned BOOLEAN NOT NULL DEFAULT FALSE")
-    cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS banned_reason TEXT")
-    cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS banned_at TIMESTAMPTZ")
+    if "users" in _SCHEMA_READY:
+        return
+    with _schema_lock:
+        if "users" in _SCHEMA_READY:
+            return
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id               SERIAL PRIMARY KEY,
+                username         TEXT NOT NULL,
+                username_lower   TEXT NOT NULL UNIQUE,
+                player_tag       TEXT NOT NULL UNIQUE,
+                password_hash    TEXT NOT NULL,
+                created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_login_at    TIMESTAMPTZ,
+                failed_attempts  INTEGER NOT NULL DEFAULT 0,
+                locked_until     TIMESTAMPTZ
+            )
+        """)
+        cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS banned BOOLEAN NOT NULL DEFAULT FALSE")
+        cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS banned_reason TEXT")
+        cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS banned_at TIMESTAMPTZ")
+        cursor.connection.commit()
+        _SCHEMA_READY.add("users")
 
 
 def ensure_login_attempts_table(cursor):
@@ -296,15 +340,22 @@ def ensure_login_attempts_table(cursor):
     se bloquea o no un intento de login; esa decisión ahora la toma esta
     tabla.
     """
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS login_attempts (
-            username_lower   TEXT NOT NULL,
-            ip               TEXT NOT NULL,
-            failed_attempts  INTEGER NOT NULL DEFAULT 0,
-            locked_until     TIMESTAMPTZ,
-            PRIMARY KEY (username_lower, ip)
-        )
-    """)
+    if "login_attempts" in _SCHEMA_READY:
+        return
+    with _schema_lock:
+        if "login_attempts" in _SCHEMA_READY:
+            return
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS login_attempts (
+                username_lower   TEXT NOT NULL,
+                ip               TEXT NOT NULL,
+                failed_attempts  INTEGER NOT NULL DEFAULT 0,
+                locked_until     TIMESTAMPTZ,
+                PRIMARY KEY (username_lower, ip)
+            )
+        """)
+        cursor.connection.commit()
+        _SCHEMA_READY.add("login_attempts")
 
 
 class RegisterBody(BaseModel):
@@ -877,56 +928,63 @@ METRIC_PLAYER_COL = {
 }
 
 def ensure_events_tables(cursor):
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS events (
-            id SERIAL PRIMARY KEY,
-            title TEXT NOT NULL,
-            description TEXT,
-            reward TEXT NOT NULL,
-            metric TEXT NOT NULL,
-            brawler_name TEXT,
-            started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            ends_at TIMESTAMPTZ NOT NULL,
-            closed_at TIMESTAMPTZ,
-            is_active BOOLEAN NOT NULL DEFAULT TRUE
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS event_snapshots (
-            id SERIAL PRIMARY KEY,
-            event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
-            player_tag TEXT NOT NULL,
-            player_name TEXT NOT NULL,
-            icon_url TEXT,
-            value_start INTEGER NOT NULL,
-            value_end INTEGER,
-            UNIQUE(event_id, player_tag)
-        )
-    """)
-    cursor.execute("""
-        DO $$
-        DECLARE c TEXT;
-        BEGIN
-            SELECT conname INTO c FROM pg_constraint
-            WHERE conrelid = 'events'::regclass AND contype = 'c' AND conname LIKE '%metric%';
-            IF c IS NOT NULL THEN
-                EXECUTE 'ALTER TABLE events DROP CONSTRAINT ' || quote_ident(c);
-            END IF;
-        END $$
-    """)
-    cursor.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS brawler_name TEXT")
-    cursor.execute("""
-        DO $$
-        BEGIN
-            IF EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_name='event_snapshots' AND column_name='trophies_start'
-            ) THEN
-                ALTER TABLE event_snapshots RENAME COLUMN trophies_start TO value_start;
-                ALTER TABLE event_snapshots RENAME COLUMN trophies_end   TO value_end;
-            END IF;
-        END $$
-    """)
+    if "events" in _SCHEMA_READY:
+        return
+    with _schema_lock:
+        if "events" in _SCHEMA_READY:
+            return
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                id SERIAL PRIMARY KEY,
+                title TEXT NOT NULL,
+                description TEXT,
+                reward TEXT NOT NULL,
+                metric TEXT NOT NULL,
+                brawler_name TEXT,
+                started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                ends_at TIMESTAMPTZ NOT NULL,
+                closed_at TIMESTAMPTZ,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS event_snapshots (
+                id SERIAL PRIMARY KEY,
+                event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+                player_tag TEXT NOT NULL,
+                player_name TEXT NOT NULL,
+                icon_url TEXT,
+                value_start INTEGER NOT NULL,
+                value_end INTEGER,
+                UNIQUE(event_id, player_tag)
+            )
+        """)
+        cursor.execute("""
+            DO $$
+            DECLARE c TEXT;
+            BEGIN
+                SELECT conname INTO c FROM pg_constraint
+                WHERE conrelid = 'events'::regclass AND contype = 'c' AND conname LIKE '%metric%';
+                IF c IS NOT NULL THEN
+                    EXECUTE 'ALTER TABLE events DROP CONSTRAINT ' || quote_ident(c);
+                END IF;
+            END $$
+        """)
+        cursor.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS brawler_name TEXT")
+        cursor.execute("""
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='event_snapshots' AND column_name='trophies_start'
+                ) THEN
+                    ALTER TABLE event_snapshots RENAME COLUMN trophies_start TO value_start;
+                    ALTER TABLE event_snapshots RENAME COLUMN trophies_end   TO value_end;
+                END IF;
+            END $$
+        """)
+        cursor.connection.commit()
+        _SCHEMA_READY.add("events")
 
 
 ADMIN_MAX_ATTEMPTS = 5
@@ -934,13 +992,20 @@ ADMIN_LOCKOUT_MINUTES = 15
 
 
 def ensure_admin_auth_table(cursor):
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS admin_auth_attempts (
-            ip              TEXT PRIMARY KEY,
-            failed_attempts INTEGER NOT NULL DEFAULT 0,
-            locked_until    TIMESTAMPTZ
-        )
-    """)
+    if "admin_auth" in _SCHEMA_READY:
+        return
+    with _schema_lock:
+        if "admin_auth" in _SCHEMA_READY:
+            return
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS admin_auth_attempts (
+                ip              TEXT PRIMARY KEY,
+                failed_attempts INTEGER NOT NULL DEFAULT 0,
+                locked_until    TIMESTAMPTZ
+            )
+        """)
+        cursor.connection.commit()
+        _SCHEMA_READY.add("admin_auth")
 
 
 def check_admin(request: Request, x_admin_key: Optional[str]):
@@ -1373,60 +1438,67 @@ EXCLUDED_RAFFLE_MONTHS = {datetime(2026, 8, 1).date()}
 
 
 def ensure_raffle_tables(cursor):
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS event_ticket_rules (
-            event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
-            position INTEGER NOT NULL,
-            tickets  INTEGER NOT NULL,
-            PRIMARY KEY (event_id, position)
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS raffle_config (
-            id         INTEGER PRIMARY KEY DEFAULT 1,
-            prize      TEXT NOT NULL DEFAULT 'Brawl Pass Plus',
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            CONSTRAINT raffle_config_single_row CHECK (id = 1)
-        )
-    """)
-    cursor.execute("""
-        INSERT INTO raffle_config (id, prize) VALUES (1, 'Brawl Pass Plus')
-        ON CONFLICT (id) DO NOTHING
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS raffle_draws (
-            id                  SERIAL PRIMARY KEY,
-            cycle_month         DATE NOT NULL UNIQUE,
-            prize               TEXT NOT NULL,
-            winner_tag          TEXT,
-            winner_name         TEXT,
-            winner_tickets      INTEGER,
-            total_tickets       INTEGER NOT NULL DEFAULT 0,
-            total_participants  INTEGER NOT NULL DEFAULT 0,
-            drawn_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    """)
-    # Migraciones idempotentes (columnas agregadas después de la primera versión
-    # de esta tabla) — permiten resortear un mes sin perder de vista a quién ya
-    # se le dio la oportunidad, para nunca repetir ganador dentro del mismo mes.
-    cursor.execute("ALTER TABLE raffle_draws ADD COLUMN IF NOT EXISTS excluded_tags TEXT[] NOT NULL DEFAULT '{}'")
-    cursor.execute("ALTER TABLE raffle_draws ADD COLUMN IF NOT EXISTS redraw_count INTEGER NOT NULL DEFAULT 0")
+    if "raffle" in _SCHEMA_READY:
+        return
+    with _schema_lock:
+        if "raffle" in _SCHEMA_READY:
+            return
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS event_ticket_rules (
+                event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                tickets  INTEGER NOT NULL,
+                PRIMARY KEY (event_id, position)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS raffle_config (
+                id         INTEGER PRIMARY KEY DEFAULT 1,
+                prize      TEXT NOT NULL DEFAULT 'Brawl Pass Plus',
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                CONSTRAINT raffle_config_single_row CHECK (id = 1)
+            )
+        """)
+        cursor.execute("""
+            INSERT INTO raffle_config (id, prize) VALUES (1, 'Brawl Pass Plus')
+            ON CONFLICT (id) DO NOTHING
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS raffle_draws (
+                id                  SERIAL PRIMARY KEY,
+                cycle_month         DATE NOT NULL UNIQUE,
+                prize               TEXT NOT NULL,
+                winner_tag          TEXT,
+                winner_name         TEXT,
+                winner_tickets      INTEGER,
+                total_tickets       INTEGER NOT NULL DEFAULT 0,
+                total_participants  INTEGER NOT NULL DEFAULT 0,
+                drawn_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        # Migraciones idempotentes (columnas agregadas después de la primera versión
+        # de esta tabla) — permiten resortear un mes sin perder de vista a quién ya
+        # se le dio la oportunidad, para nunca repetir ganador dentro del mismo mes.
+        cursor.execute("ALTER TABLE raffle_draws ADD COLUMN IF NOT EXISTS excluded_tags TEXT[] NOT NULL DEFAULT '{}'")
+        cursor.execute("ALTER TABLE raffle_draws ADD COLUMN IF NOT EXISTS redraw_count INTEGER NOT NULL DEFAULT 0")
 
-    # Tickets diarios reclamados a mano desde la web (2 por día, ver
-    # /raffle/claim-daily). El UNIQUE (player_tag, claim_date) es la
-    # verdadera barrera anti-doble-reclamo: es una restricción de base de
-    # datos, no una validación de aplicación, así que ni una condición de
-    # carrera ni un reintento manual pueden burlarla.
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS daily_ticket_claims (
-            id          SERIAL PRIMARY KEY,
-            player_tag  TEXT NOT NULL,
-            claim_date  DATE NOT NULL,
-            tickets     INTEGER NOT NULL DEFAULT 2,
-            claimed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            UNIQUE (player_tag, claim_date)
-        )
-    """)
+        # Tickets diarios reclamados a mano desde la web (2 por día, ver
+        # /raffle/claim-daily). El UNIQUE (player_tag, claim_date) es la
+        # verdadera barrera anti-doble-reclamo: es una restricción de base de
+        # datos, no una validación de aplicación, así que ni una condición de
+        # carrera ni un reintento manual pueden burlarla.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS daily_ticket_claims (
+                id          SERIAL PRIMARY KEY,
+                player_tag  TEXT NOT NULL,
+                claim_date  DATE NOT NULL,
+                tickets     INTEGER NOT NULL DEFAULT 2,
+                claimed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (player_tag, claim_date)
+            )
+        """)
+        cursor.connection.commit()
+        _SCHEMA_READY.add("raffle")
 
 
 def ensure_predictions_table(cursor):
@@ -1442,21 +1514,28 @@ def ensure_predictions_table(cursor):
     daily_ticket_claims, la restricción real es la UNIQUE de abajo, no una
     validación de aplicación.
     """
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS player_predictions (
-            id             SERIAL PRIMARY KEY,
-            predictor_tag  TEXT NOT NULL,
-            target_day     DATE NOT NULL,
-            predicted_tag  TEXT NOT NULL,
-            created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            resolved_at    TIMESTAMPTZ,
-            correct        BOOLEAN,
-            winner_tag     TEXT,
-            ticket_claimed BOOLEAN NOT NULL DEFAULT FALSE,
-            UNIQUE (predictor_tag, target_day)
-        )
-    """)
+    if "predictions" in _SCHEMA_READY:
+        return
+    with _schema_lock:
+        if "predictions" in _SCHEMA_READY:
+            return
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS player_predictions (
+                id             SERIAL PRIMARY KEY,
+                predictor_tag  TEXT NOT NULL,
+                target_day     DATE NOT NULL,
+                predicted_tag  TEXT NOT NULL,
+                created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                resolved_at    TIMESTAMPTZ,
+                correct        BOOLEAN,
+                winner_tag     TEXT,
+                ticket_claimed BOOLEAN NOT NULL DEFAULT FALSE,
+                UNIQUE (predictor_tag, target_day)
+            )
+        """)
+        cursor.connection.commit()
+        _SCHEMA_READY.add("predictions")
 
 
 def uy_today():
@@ -1665,7 +1744,6 @@ def getRaffle(request: Request):
     from datetime import timedelta
     try:
         ensure_raffle_tables(cursor)
-        conn.commit()
 
         now_uy = datetime.now(timezone.utc) - timedelta(hours=3)
         month_start, month_end = uy_month_bounds(now_uy.year, now_uy.month)
@@ -1721,7 +1799,6 @@ def getClaimDailyStatus(request: Request, user=Depends(get_current_user)):
     cursor = conn.cursor()
     try:
         ensure_raffle_tables(cursor)
-        conn.commit()
 
         today = uy_today()
         cursor.execute("""
@@ -1832,7 +1909,6 @@ def getPredictionsToday(request: Request, user=Depends(get_current_user)):
     try:
         ensure_predictions_table(cursor)
         ensure_player_of_day_table(cursor)
-        conn.commit()
 
         from datetime import timedelta
         today = uy_today()
@@ -2254,22 +2330,29 @@ def redrawRaffle(request: Request, body: RedrawBody, x_admin_key: Optional[str] 
 # Uruguay y top 200 del Mundo). Se pisa por completo en cada corrida del
 # datacollector (no nos interesa el historial, solo la posición actual).
 def ensure_club_rankings_table(cursor):
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS club_rankings (
-            region       TEXT NOT NULL,
-            rank         INTEGER NOT NULL,
-            club_tag     TEXT NOT NULL,
-            club_name    TEXT NOT NULL,
-            trophies     INTEGER NOT NULL,
-            member_count INTEGER,
-            fetched_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            PRIMARY KEY (region, club_tag)
-        )
-    """)
-    cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_club_rankings_region_rank
-        ON club_rankings(region, rank)
-    """)
+    if "club_rankings" in _SCHEMA_READY:
+        return
+    with _schema_lock:
+        if "club_rankings" in _SCHEMA_READY:
+            return
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS club_rankings (
+                region       TEXT NOT NULL,
+                rank         INTEGER NOT NULL,
+                club_tag     TEXT NOT NULL,
+                club_name    TEXT NOT NULL,
+                trophies     INTEGER NOT NULL,
+                member_count INTEGER,
+                fetched_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (region, club_tag)
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_club_rankings_region_rank
+            ON club_rankings(region, rank)
+        """)
+        cursor.connection.commit()
+        _SCHEMA_READY.add("club_rankings")
 
 
 @app.get("/club-rankings")
@@ -2279,7 +2362,6 @@ def getClubRankings(request: Request):
     cursor = conn.cursor()
     try:
         ensure_club_rankings_table(cursor)
-        conn.commit()
 
         result = {}
         for region in ("UY", "global"):
@@ -2338,21 +2420,28 @@ def getStatus(request: Request):
 # Se guarda el resultado en la tabla player_of_day para historial de 7 días.
 
 def ensure_player_of_day_table(cursor):
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS player_of_day (
-            day         DATE PRIMARY KEY,
-            player_tag  TEXT NOT NULL,
-            player_name TEXT NOT NULL,
-            icon_url    TEXT,
-            club_name   TEXT,
-            points      INTEGER NOT NULL,
-            delta_trophies  INTEGER NOT NULL DEFAULT 0,
-            delta_wins3v3   INTEGER NOT NULL DEFAULT 0,
-            delta_winsSolo  INTEGER NOT NULL DEFAULT 0,
-            delta_prestige  INTEGER NOT NULL DEFAULT 0,
-            computed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    """)
+    if "player_of_day" in _SCHEMA_READY:
+        return
+    with _schema_lock:
+        if "player_of_day" in _SCHEMA_READY:
+            return
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS player_of_day (
+                day         DATE PRIMARY KEY,
+                player_tag  TEXT NOT NULL,
+                player_name TEXT NOT NULL,
+                icon_url    TEXT,
+                club_name   TEXT,
+                points      INTEGER NOT NULL,
+                delta_trophies  INTEGER NOT NULL DEFAULT 0,
+                delta_wins3v3   INTEGER NOT NULL DEFAULT 0,
+                delta_winsSolo  INTEGER NOT NULL DEFAULT 0,
+                delta_prestige  INTEGER NOT NULL DEFAULT 0,
+                computed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cursor.connection.commit()
+        _SCHEMA_READY.add("player_of_day")
 
 
 def get_today_live_ranking(cursor, today):
@@ -2483,7 +2572,6 @@ def getPlayerOfDay(request: Request):
     cursor = conn.cursor()
     try:
         ensure_player_of_day_table(cursor)
-        conn.commit()
 
         from datetime import date, timedelta
         today = (datetime.now(timezone.utc) - timedelta(hours=3)).date()
@@ -2497,22 +2585,32 @@ def getPlayerOfDay(request: Request):
         # ── Ranking de hoy en vivo (top 20 con deltas) ──────────────────
         today_ranking = get_today_live_ranking(cursor, today)
 
-        # ── Historial: ganadores de días anteriores (últimos 7, sin hoy) ─
+        # ── Historial (últimos 7 días, sin hoy) + computed_at de hoy ─────
+        # Antes eran 2 SELECT separados: uno para el historial (day < hoy)
+        # y otro aparte solo para leer el computed_at de HOY (necesario
+        # para el fallback de last_updated más abajo). Se combinan en uno
+        # solo ampliando el rango a [hoy-7, hoy] (8 días posibles, de ahí
+        # el LIMIT 8) y separando la fila de "hoy" en Python — el
+        # resultado es exactamente el mismo, un round-trip menos.
         cursor.execute("""
             SELECT day, player_tag, player_name, icon_url, club_name,
                    points, delta_trophies, delta_wins3v3, delta_winsSolo,
                    delta_prestige, computed_at
             FROM player_of_day
-            WHERE day >= %s AND day < %s
+            WHERE day >= %s AND day <= %s
             ORDER BY day DESC
-            LIMIT 7
+            LIMIT 8
         """, (today - timedelta(days=7), today))
 
         history = []
         last_updated = None
+        today_computed_at = None
         for row in cursor.fetchall():
             (day, tag, name, icon_url, club_name,
              points, dt, dw3, dws, dp, computed_at) = row
+            if day == today:
+                today_computed_at = computed_at
+                continue
             if last_updated is None and computed_at:
                 last_updated = computed_at.isoformat()
             history.append({
@@ -2529,10 +2627,8 @@ def getPlayerOfDay(request: Request):
             })
 
         # last_updated: usar computed_at del registro de hoy si existe
-        cursor.execute("SELECT computed_at FROM player_of_day WHERE day = %s", (today,))
-        row = cursor.fetchone()
-        if row and row[0]:
-            last_updated = row[0].isoformat()
+        if today_computed_at:
+            last_updated = today_computed_at.isoformat()
 
         return {
             "last_updated":   last_updated,
