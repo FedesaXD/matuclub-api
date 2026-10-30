@@ -221,6 +221,18 @@ def normalize_tag(tag: str) -> str:
     return tag
 
 
+def canonical_tag(tag: str) -> str:
+    """
+    Forma canónica de una tag SOLO para comparar tags entre tablas (users vs
+    players). Las tags de Brawl Stars no usan la letra O: el juego la trata
+    como el número 0. TAG_RE sí deja registrarse con la letra O, así que un
+    usuario puede tener guardado "#2YCORRPV" mientras que players (que viene
+    de la API oficial) tiene "#2YC0RRPV". Comparando las formas canónicas, los
+    dos matchean. No se usa para guardar nada, solo para comparar.
+    """
+    return normalize_tag(tag).replace("O", "0")
+
+
 def create_access_token(user_id: int, username: str, tag: str) -> str:
     from datetime import timedelta
     payload = {
@@ -1704,13 +1716,27 @@ def compute_raffle_tickets(cursor, month_start: datetime, month_end: datetime):
     # aunque hubiera acumulado tickets en otras tablas (daily_ticket_claims,
     # player_predictions), esos valores simplemente nunca se leen para un
     # tag que no está en este loop. No hace falta un chequeo aparte acá.
-    cursor.execute("SELECT player_tag FROM users WHERE banned = TRUE")
-    banned_tags = {row[0] for row in cursor.fetchall()}
+    #
+    # Registro en la página: solo puede GANAR un jugador cuya tag esté en la
+    # tabla `users` (y no baneado). Acá solo se marca cada fila con
+    # "registered"; el filtro que realmente impide ganar está en
+    # /raffle/draw y /admin/raffle/redraw. El ranking sigue listando a todos
+    # los jugadores del club (con sus tickets) — así el frontend puede
+    # mostrar quién todavía no se registró.
+    # Las tags se comparan en forma canónica (O -> 0, ver canonical_tag) para
+    # que un usuario registrado con la letra O no quede afuera por error —
+    # y, por el mismo motivo, para que un baneo tampoco se pueda esquivar así.
+    cursor.execute("SELECT player_tag, banned FROM users")
+    banned_tags, registered_tags = set(), set()
+    for (user_tag, is_banned) in cursor.fetchall():
+        (banned_tags if is_banned else registered_tags).add(canonical_tag(user_tag))
+    registered_tags -= banned_tags
 
     cursor.execute("SELECT tag, name, icon_url, club_name FROM players")
     result = []
     for (tag, name, icon_url, club_name) in cursor.fetchall():
-        if tag in banned_tags:
+        ctag = canonical_tag(tag)
+        if ctag in banned_tags:
             continue
         potd = potd_map.get(tag, 0)
         troph = trophies_map.get(tag, 0)
@@ -1722,6 +1748,7 @@ def compute_raffle_tickets(cursor, month_start: datetime, month_end: datetime):
             "name": name,
             "icon_url": icon_url,
             "club_name": club_name,
+            "registered": ctag in registered_tags,
             "tickets_player_of_day": potd,
             "tickets_trophies": troph,
             "tickets_events": ev,
@@ -2162,7 +2189,8 @@ def updateRaffleConfig(request: Request, body: RaffleConfigBody, x_admin_key: Op
 
 def pick_weighted_winner(eligible):
     """Elige un ganador al azar, ponderado por tickets. eligible ya debe venir
-    filtrado (tickets_total > 0, excluidos los que correspondan)."""
+    filtrado (tickets_total > 0, registrado en la página, excluidos los que
+    correspondan)."""
     if not eligible:
         return None
     rng = random.SystemRandom()
@@ -2207,7 +2235,8 @@ def drawRaffle(request: Request, x_admin_key: Optional[str] = Header(None)):
 
         month_start, month_end = uy_month_bounds(prev_year, prev_month)
         ranking = compute_raffle_tickets(cursor, month_start, month_end)
-        eligible = [r for r in ranking if r["tickets_total"] > 0]
+        # Solo participan del sorteo los jugadores registrados en la página.
+        eligible = [r for r in ranking if r["tickets_total"] > 0 and r["registered"]]
 
         cursor.execute("SELECT prize FROM raffle_config WHERE id = 1")
         row = cursor.fetchone()
@@ -2287,7 +2316,12 @@ def redrawRaffle(request: Request, body: RedrawBody, x_admin_key: Optional[str] 
 
         month_start, month_end = uy_month_bounds(cycle_date.year, cycle_date.month)
         ranking = compute_raffle_tickets(cursor, month_start, month_end)
-        eligible = [r for r in ranking if r["tickets_total"] > 0 and r["tag"] not in new_excluded]
+        eligible = [
+            r for r in ranking
+            if r["tickets_total"] > 0
+            and r["registered"]
+            and r["tag"] not in new_excluded
+        ]
 
         winner = pick_weighted_winner(eligible)
 
